@@ -1,0 +1,4 @@
+[submodule "zama"]
+	path = zama
+	url = https://github.com/zama-ai/fhevm.git
+	branch = feature/solana

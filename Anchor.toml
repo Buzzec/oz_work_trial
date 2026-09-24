@@ -1,0 +1,19 @@
+[toolchain]
+anchor_version = "1.2.0"
+solana_version = "4.1.2"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+confidential_rfq = "7Y7wXXw2GWp6v3FMSQYrMqbB6re5cs2E8i7HqgKwCXpp"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "bash scripts/test-confidential-rfq.sh"
+
+[hooks]

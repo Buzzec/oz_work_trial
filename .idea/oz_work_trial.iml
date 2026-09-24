@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/programs/confidential_rfq/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/program-environment/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/solana-ed25519-instruction/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/zama-fhe/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/zama-solana-acl/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/zama-solana-acl/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/zama-solana-permit/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/zama-solana-permit/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/zama-solana-request/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/crates/zama-solana-transaction/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/programs/confidential-batcher/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/programs/confidential-token/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/programs/delegator-vault/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/programs/demo-vault/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/programs/dep-chain/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/programs/encrypted-counter/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/programs/zama-host/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/runtime-tests/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/zama/solana/test-kit/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/programs/confidential_rfq/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+      <excludeFolder url="file://$MODULE_DIR$/zama/solana/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>
