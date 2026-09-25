@@ -5,7 +5,7 @@ use crate::{
     errors::ConfidentialRfqError,
     state::{
         market::{Market, MarketExt},
-        rfq::{RFQ, RFQPrivateField},
+        rfq::{RFQ, RFQPrivateField, RFQStore, invalid_fhe},
     },
     util::{
         ConfidentialTokenEventAuthority, Contains, HostConfig, InputExt, InstructionsAccount,
@@ -195,28 +195,12 @@ pub fn request_quote<'info>(
     let asset_transferred = transfer_to_escrow(&ctx, *asset_escrow, AssetOrBasis::Asset)?;
     let basis_transferred = transfer_to_escrow(&ctx, *basis_escrow, AssetOrBasis::Basis)?;
 
-    let asset_refund = calculate_refund(
-        &ctx,
-        asset_transferred,
-        basis_transferred,
-        AssetOrBasis::Asset,
-        rfq_seeds,
-    )?;
-    let basis_refund = calculate_refund(
-        &ctx,
-        asset_transferred,
-        basis_transferred,
-        AssetOrBasis::Basis,
-        rfq_seeds,
-    )?;
+    check_for_invalid_quote(&ctx, asset_transferred, basis_transferred, rfq_seeds)?;
 
-    activate_quote(
-        &ctx,
-        asset_transferred,
-        basis_transferred,
-        maker_group,
-        rfq_seeds,
-    )?;
+    // Refund the transferred amounts only when the quote is invalid (can_close is true), otherwise these are 0.
+    let asset_refund = calculate_refund(&ctx, asset_transferred, AssetOrBasis::Asset, rfq_seeds)?;
+    let basis_refund = calculate_refund(&ctx, basis_transferred, AssetOrBasis::Basis, rfq_seeds)?;
+
     refund_to_user(&ctx, asset_refund, true, rfq_seeds)?;
     refund_to_user(&ctx, basis_refund, false, rfq_seeds)?;
 
@@ -294,112 +278,25 @@ fn initialize_fields<'info>(
     crate::util::request_quote_cpi::execute_initialization(ctx, execution, authority_seeds)
 }
 
-/// Reuses both transfer-result grants to return one refund handle. Neither
-/// refund is stored persistently; each is granted to the token balance Store.
+/// Checks for an invalid quote (not enough tokens) and sets can_close to true if so
 #[inline(never)]
-fn calculate_refund<'info>(
+fn check_for_invalid_quote<'info>(
     ctx: &Context<'info, RequestQuote<'info>>,
     asset_handle: [u8; 32],
     basis_handle: [u8; 32],
-    asset_or_basis: AssetOrBasis,
-    authority_seeds: &[&[u8]],
-) -> Result<[u8; 32]> {
-    let token_side = match asset_or_basis {
-        AssetOrBasis::Asset => &ctx.accounts.asset,
-        AssetOrBasis::Basis => &ctx.accounts.basis,
-    };
-
-    let state = read_state(&ctx.accounts.rfq_store)?;
-    let store = Store::new(&state);
-    let buyer = store
-        .get::<Bool>(RFQPrivateField::UserBuyer.key())
-        .map_err(invalid_fhe)?;
-    let requested_size = store
-        .get::<Uint<64>>(RFQPrivateField::BestMaker.key())
-        .map_err(invalid_fhe)?;
-    let requested_limit = store
-        .get::<Uint<64>>(RFQPrivateField::BestOffer.key())
-        .map_err(invalid_fhe)?;
-    let asset = store
-        .granted::<Uint<64>>(asset_handle)
-        .map_err(invalid_fhe)?;
-    let basis = store
-        .granted::<Uint<64>>(basis_handle)
-        .map_err(invalid_fhe)?;
-
-    let target = ct::balance_slot(
-        token_side.confidential_mint.key(),
-        token_side.rfq_token_account.key(),
-    )
-    .0;
-    let target_account = token_side.rfq_balance_store.to_account_info();
-    let execution: ReturningFheExecution<Uint<64>> =
-        FheExecution::build_returning(store.id(), |fhe| {
-            let zero = fhe.trivial_encrypt_u64(0)?;
-            let expected_asset = fhe.if_then_else(buyer, zero, requested_size)?;
-            let expected_basis = fhe.if_then_else(buyer, requested_limit, zero)?;
-            let asset_exact = fhe.eq(asset, expected_asset)?;
-            let basis_exact = fhe.eq(basis, expected_basis)?;
-            let positive_size = fhe.gt(requested_size, Scalar::<Uint<64>>::u64(0))?;
-            let both_exact = fhe.and(asset_exact, basis_exact)?;
-            let valid = fhe.and(both_exact, positive_size)?;
-            let actual = match asset_or_basis {
-                AssetOrBasis::Asset => asset,
-                AssetOrBasis::Basis => basis,
-            };
-            let refund = fhe.if_then_else(valid, zero, actual)?;
-            fhe.output(refund, store.result().allow_transient(target))?;
-            Ok(refund)
-        })
-        .map_err(invalid_fhe)?;
-    crate::util::cpi::invoke_returning(
-        execution,
-        zama_fhe::ExecutionCpiAccounts {
-            payer: ctx.accounts.user.to_account_info(),
-            authority: ctx.accounts.rfq.to_account_info(),
-            host_config: ctx.accounts.host_config.to_account_info(),
-            deny_scope_records: ctx.remaining_accounts.to_vec(),
-            system_program: ctx.accounts.system_program.to_account_info(),
-            hcu_block_meter: None,
-            hcu_trusted_app_record: None,
-            rand_nonce: None,
-            event_authority: ctx.accounts.zama_event_authority.to_account_info(),
-            transient_store: ctx.accounts.transient_store.to_account_info(),
-            instructions: ctx.accounts.instructions.to_account_info(),
-            program: ctx.accounts.zama_program.to_account_info(),
-        },
-        [ctx.accounts.rfq_store.to_account_info(), target_account],
-        [ctx.accounts.rfq.to_account_info()],
-        &[authority_seeds],
-    )
-}
-
-#[inline(never)]
-fn activate_quote<'info>(
-    ctx: &Context<'info, RequestQuote<'info>>,
-    asset_handle: [u8; 32],
-    basis_handle: [u8; 32],
-    maker_group: Pubkey,
     authority_seeds: &[&[u8]],
 ) -> Result<()> {
     let state = read_state(&ctx.accounts.rfq_store)?;
-    let store = Store::new(&state);
-    let buyer = store
-        .get::<Bool>(RFQPrivateField::UserBuyer.key())
-        .map_err(invalid_fhe)?;
-    let requested_size = store
-        .get::<Uint<64>>(RFQPrivateField::BestMaker.key())
-        .map_err(invalid_fhe)?;
-    let requested_limit = store
-        .get::<Uint<64>>(RFQPrivateField::BestOffer.key())
-        .map_err(invalid_fhe)?;
+    let store = RFQStore(Store::new(&state));
+    let buyer = store.user_buyer()?;
+    let requested_size = store.size()?;
+    let requested_limit = store.offer_limit()?;
     let asset = store
         .granted::<Uint<64>>(asset_handle)
         .map_err(invalid_fhe)?;
     let basis = store
         .granted::<Uint<64>>(basis_handle)
         .map_err(invalid_fhe)?;
-    let user = ctx.accounts.user.key();
     let execution = FheExecution::build(store.id(), |fhe| {
         let zero = fhe.trivial_encrypt_u64(0)?;
         let expected_asset = fhe.if_then_else(buyer, zero, requested_size)?;
@@ -409,23 +306,12 @@ fn activate_quote<'info>(
         let positive_size = fhe.gt(requested_size, Scalar::<Uint<64>>::u64(0))?;
         let both_exact = fhe.and(asset_exact, basis_exact)?;
         let valid = fhe.and(both_exact, positive_size)?;
-        let active_size = fhe.if_then_else(valid, requested_size, zero)?;
-        let active_limit = fhe.if_then_else(valid, requested_limit, zero)?;
-        let best_offer = fhe.add(active_limit, Scalar::<Uint<64>>::u64(0))?;
-        let no_maker = fhe.trivial_encrypt_u64(0)?;
+        let can_close = fhe.not(valid)?;
+
         fhe.output(
-            active_size,
-            store
-                .set(RFQPrivateField::Size.key())
-                .allow(user)
-                .allow(maker_group),
+            can_close,
+            store.set(RFQPrivateField::CanClose.key()).make_public(),
         )?;
-        fhe.output(
-            active_limit,
-            store.set(RFQPrivateField::OfferLimit.key()).allow(user),
-        )?;
-        fhe.output(best_offer, store.set(RFQPrivateField::BestOffer.key()))?;
-        fhe.output(no_maker, store.set(RFQPrivateField::BestMaker.key()))?;
         Ok(())
     })
     .map_err(invalid_fhe)?;
@@ -451,7 +337,59 @@ fn activate_quote<'info>(
     )
 }
 
-fn invalid_fhe(error: zama_fhe::FheExecutionBuildError) -> Error {
-    msg!("invalid FHE execution: {:?}", error);
-    error!(ConfidentialRfqError::InvalidFheExecution)
+/// Returns the transferred amount when CanClose is true, or zero otherwise.
+/// The refund is granted to the token balance Store without storing it persistently.
+#[inline(never)]
+fn calculate_refund<'info>(
+    ctx: &Context<'info, RequestQuote<'info>>,
+    transferred_handle: [u8; 32],
+    asset_or_basis: AssetOrBasis,
+    authority_seeds: &[&[u8]],
+) -> Result<[u8; 32]> {
+    let token_side = match asset_or_basis {
+        AssetOrBasis::Asset => &ctx.accounts.asset,
+        AssetOrBasis::Basis => &ctx.accounts.basis,
+    };
+
+    let state = read_state(&ctx.accounts.rfq_store)?;
+    let store = RFQStore(Store::new(&state));
+    let can_close = store.can_close()?;
+    let transferred = store
+        .granted::<Uint<64>>(transferred_handle)
+        .map_err(invalid_fhe)?;
+
+    let target = ct::balance_slot(
+        token_side.confidential_mint.key(),
+        token_side.rfq_token_account.key(),
+    )
+    .0;
+    let target_account = token_side.rfq_balance_store.to_account_info();
+    let execution: ReturningFheExecution<Uint<64>> =
+        FheExecution::build_returning(store.id(), |fhe| {
+            let zero = fhe.trivial_encrypt_u64(0)?;
+            let refund = fhe.if_then_else(can_close, transferred, zero)?;
+            fhe.output(refund, store.result().allow_transient(target))?;
+            Ok(refund)
+        })
+        .map_err(invalid_fhe)?;
+    crate::util::cpi::invoke_returning(
+        execution,
+        zama_fhe::ExecutionCpiAccounts {
+            payer: ctx.accounts.user.to_account_info(),
+            authority: ctx.accounts.rfq.to_account_info(),
+            host_config: ctx.accounts.host_config.to_account_info(),
+            deny_scope_records: ctx.remaining_accounts.to_vec(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+            hcu_block_meter: None,
+            hcu_trusted_app_record: None,
+            rand_nonce: None,
+            event_authority: ctx.accounts.zama_event_authority.to_account_info(),
+            transient_store: ctx.accounts.transient_store.to_account_info(),
+            instructions: ctx.accounts.instructions.to_account_info(),
+            program: ctx.accounts.zama_program.to_account_info(),
+        },
+        [ctx.accounts.rfq_store.to_account_info(), target_account],
+        [ctx.accounts.rfq.to_account_info()],
+        &[authority_seeds],
+    )
 }
