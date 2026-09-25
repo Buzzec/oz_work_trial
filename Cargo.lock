@@ -359,6 +359,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85f6d2ad797b45d3e4b3364b433e78e4e95729ae2a187fe7032b976f54b5a2fb"
 dependencies = [
  "anchor-lang",
+ "spl-associated-token-account-interface",
  "spl-token-2022-interface",
  "spl-token-interface",
 ]
@@ -988,11 +989,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "confidential-token"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "program-environment",
+ "solana-ed25519-instruction",
+ "solana-instructions-sysvar",
+ "solana-sha256-hasher",
+ "zama-fhe",
+ "zama-host",
+ "zama-solana-acl",
+]
+
+[[package]]
 name = "confidential_rfq"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "bytemuck",
+ "confidential-token",
  "mollusk-svm",
  "solana-sdk",
  "zama-fhe",
@@ -4445,6 +4462,16 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "spl-associated-token-account-interface"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6433917b60441d68d99a17e121d9db0ea15a9a69c0e5afa34649cf5ba12612f"
+dependencies = [
+ "solana-instruction 3.5.1",
+ "solana-pubkey 3.0.0",
 ]
 
 [[package]]

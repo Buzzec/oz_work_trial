@@ -13,10 +13,11 @@ default = []
 cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build", "zama-host/idl-build"]
+idl-build = ["anchor-lang/idl-build", "confidential-token/idl-build", "zama-host/idl-build"]
 
 [dependencies]
 anchor-lang.workspace = true
+confidential-token = { path = "../../zama/solana/programs/confidential-token", features = ["cpi"] }
 zama-fhe = { workspace = true, features = ["cpi"] }
 zama-host = { workspace = true, features = ["cpi"] }
 bytemuck.workspace = true

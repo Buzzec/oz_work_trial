@@ -15,6 +15,8 @@
 
 Optional versions of these ids are `u64`s, with `0` representing `None`.
 
+Markets start with an empty maker map. Adding or removing a maker reallocates the account to fit the current membership; the admin pays additional rent on growth and receives the unused rent on shrinkage.
+
 | Field            | Type                   | Description                                                                                   |
 |------------------|------------------------|-----------------------------------------------------------------------------------------------|
 | Admin            | `Pubkey`               | The admin for this market.                                                                    |
@@ -23,15 +25,16 @@ Optional versions of these ids are `u64`s, with `0` representing `None`.
 
 ## RFQ
 
-| Field       | Type       | Description                                          |
-|-------------|------------|------------------------------------------------------|
-| Nonce       | `[u8; 32]` | Random nonce to prevent account replacement attacks. |
-| Bump        | `u8`       | The bump for the RFQ's authority PDA.                |
-| Market      | `Pubkey`   | The market the RFQ is against.                       |
-| User        | `Pubkey`   | The user that placed the RFQ.                        |
-| Bid Count   | `u64`      | The amount of bids placed on the RFQ.                |
-| Asset Token | `Pubkey`   | The token that is being bought/sold.                 |
-| Basis Token | `Pubkey`   | The token used as currency.                          |
+| Field       | Type            | Description                                                      |
+|-------------|-----------------|------------------------------------------------------------------|
+| Nonce       | `[u8; 32]`      | Random nonce to prevent account replacement attacks.             |
+| Bump        | `u8`            | The bump for the RFQ's authority PDA.                            |
+| Market      | `Pubkey`        | The market the RFQ is against.                                   |
+| User        | `Pubkey`        | The user that placed the RFQ.                                    |
+| Timeout     | `UnixTimestamp` | When this RFQ expires. All maker bids must last until this time. |
+| Bid Count   | `u64`           | The amount of bids placed on the RFQ.                            |
+| Asset Token | `Pubkey`        | The token that is being bought/sold.                             |
+| Basis Token | `Pubkey`        | The token used as currency.                                      |
 
 ### Private Fields
 
@@ -39,7 +42,6 @@ Optional versions of these ids are `u64`s, with `0` representing `None`.
 |---------------|-------------------|-------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------|
 | User Is Buyer | "user_buyer"      | `bool`            | True if the user escrows the basis token, false if the user escrows the asset token.                                                                             | User            |
 | User Claimed  | "user_claimed     | `bool`            | True if the user has claimed after the RFQ expires.                                                                                                              | User            |            
-| Timeout       | "timeout"         | `UnixTimestamp`   | When this RFQ expires. All maker bids must last until this time.                                                                                                 | User and Makers |
 | Offer Limit   | "offer_limit"     | `u64`             | Any offer below/above this is rejected, based on whether the user is the buyer or seller.                                                                        | User            |
 | Size          | "size"            | `u64`             | The amount of asset sub-tokens the user wishes to buy/sell.                                                                                                      | User and Makers |
 | Best Amount   | "best_offer"      | `u64`             | The best conter sub-token amount a maker has made.                                                                                                               | None            |
@@ -58,6 +60,7 @@ The RFQ owns both asset and basis tokens. The makers deposit both, sufficient to
 - User: The user is public because solana would track who opened the account anyway. This could be hidden with a complex batching system that tracks users by ID and publishes RFQs in batches, but I'm calling that out of scope.
 - Tokens Involved: It would be possible to encrypt the tokens involved in the trade, but the confidential token program does not support encrypting what tokens are stored in each account.
 - Maker bid count: We could make this private, but it would be trivially easy to recreate based on transaction history.
+- Timeout: We need to keep this public for bookkeeping reasons, it could be made private if doing rent properly
 
 # Operations
 

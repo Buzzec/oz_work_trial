@@ -1,6 +1,7 @@
 pub mod market;
 pub mod rfq;
 
+use crate::ConfidentialRfqError;
 use anchor_lang::prelude::*;
 use std::num::NonZeroU64;
 
@@ -32,6 +33,8 @@ pub const fn extend_key_u64<const N: usize>(key: &[u8], value: u64) -> [u8; N] {
 
 pub trait CurrentAccountVersion {
     const VERSION: u8;
+
+    fn version(&self) -> u8;
 }
 
 #[cfg(test)]
