@@ -2,7 +2,9 @@
 
 use anchor_lang::prelude::*;
 use confidential_token as ct;
-use zama_fhe::{Bool, FheExecution, Scalar, Store, StoreId, Uint};
+use zama_fhe::{
+    Bool, Encrypted, FheExecution, FheExecutionBuilder, FheHandle, Scalar, Store, StoreId, Uint,
+};
 use zama_host::{EncryptedStore, program::ZamaHost};
 
 use crate::{
@@ -10,7 +12,8 @@ use crate::{
     state::rfq::{RFQ, RFQPrivateField},
     util::{
         cpi,
-        pda::{rfq_authority_address, rfq_authority_signer_seeds},
+        pda::rfq_state_signer_seeds,
+        rfq::validate_rfq_store,
         token_side::{
             __client_accounts_token_side, __cpi_client_accounts_token_side, TokenSide,
             TokenSideBumps,
@@ -23,8 +26,6 @@ pub struct ClaimRfqUser<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     pub rfq: AccountLoader<'info, RFQ>,
-    /// CHECK: validated against the nonce-bound RFQ authority PDA below.
-    pub rfq_authority: UncheckedAccount<'info>,
     /// Encrypted RFQ state, checked against the nonce-bound RFQ identity below.
     #[account(mut)]
     pub rfq_store: Box<Account<'info, EncryptedStore>>,
@@ -48,13 +49,12 @@ pub struct ClaimRfqUser<'info> {
 
 pub fn claim_rfq_user<'info>(ctx: Context<'info, ClaimRfqUser<'info>>) -> Result<()> {
     let rfq_key = ctx.accounts.rfq.key();
-    let rfq = ctx.accounts.rfq.load()?;
-    let nonce = rfq.nonce;
+    let rfq = *ctx.accounts.rfq.load()?;
+    let nonce = ctx.accounts.rfq_store.scope;
     let rfq_user = rfq.user;
     let asset_mint = rfq.asset_mint;
     let basis_mint = rfq.basis_mint;
     let bid_count = rfq.bid_count;
-    let authority_bump = rfq.authority_bump;
     let timeout = rfq.timeout;
     require!(
         rfq.version == RFQ::VERSION,
@@ -75,22 +75,18 @@ pub fn claim_rfq_user<'info>(ctx: Context<'info, ClaimRfqUser<'info>>) -> Result
         basis_mint,
         ConfidentialRfqError::MintMismatch
     );
-    let (authority, bump) = rfq_authority_address(&rfq_key, &nonce);
-    require!(
-        bump == authority_bump,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    require_keys_eq!(
-        ctx.accounts.rfq_authority.key(),
-        authority,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
+    validate_rfq_store(
+        rfq_key,
+        &rfq,
+        ctx.accounts.rfq_store.key(),
+        &ctx.accounts.rfq_store,
+    )?;
     for (mint, side) in [
         (asset_mint, &ctx.accounts.asset),
         (basis_mint, &ctx.accounts.basis),
     ] {
         for (owner, token, balance_store) in [
-            (authority, &side.rfq_token_account, &side.rfq_balance_store),
+            (rfq_key, &side.rfq_token_account, &side.rfq_balance_store),
             (
                 rfq_user,
                 &side.participant_token_account,
@@ -110,23 +106,11 @@ pub fn claim_rfq_user<'info>(ctx: Context<'info, ClaimRfqUser<'info>>) -> Result
             );
         }
     }
-    require_keys_eq!(
-        ctx.accounts.rfq_store.key(),
-        ctx.accounts.rfq_store.canonical_address().0,
-        ConfidentialRfqError::RfqStoreMismatch
-    );
-    require!(
-        ctx.accounts.rfq_store.program == crate::ID
-            && ctx.accounts.rfq_store.authority == authority
-            && ctx.accounts.rfq_store.scope == nonce,
-        ConfidentialRfqError::RfqStoreMismatch
-    );
     require!(
         Clock::get()?.unix_timestamp >= timeout,
         ConfidentialRfqError::RfqNotExpired
     );
-    let bump_bytes = [authority_bump];
-    let seeds = &rfq_authority_signer_seeds(&rfq_key, &nonce, &bump_bytes);
+    let seeds = &rfq_state_signer_seeds(&rfq, &nonce);
     // Both encrypted payouts are produced in this one public instruction.
     // Basis runs first; the asset execution also seals UserClaimed and CanClose.
     let basis_handle = execute_user_payout(&ctx, bid_count, seeds, false)?;
@@ -142,26 +126,28 @@ fn execute_user_payout<'info>(
     asset: bool,
 ) -> Result<[u8; 32]> {
     let store = Box::new(Store::new(&ctx.accounts.rfq_store));
-    let buyer = store
-        .get::<Bool>(RFQPrivateField::UserBuyer.key())
-        .map_err(invalid_fhe)?;
-    let claimed = store
-        .get::<Bool>(RFQPrivateField::UserClaimed.key())
-        .map_err(invalid_fhe)?;
-    let best_offer = store
-        .get::<Uint<64>>(RFQPrivateField::BestOffer.key())
-        .map_err(invalid_fhe)?;
-    let best_maker = store
-        .get::<Uint<64>>(RFQPrivateField::BestMaker.key())
-        .map_err(invalid_fhe)?;
-    let size = store
-        .get::<Uint<64>>(RFQPrivateField::Size.key())
-        .map_err(invalid_fhe)?;
+    let inputs = Box::new(UserPayoutInputs {
+        buyer: store
+            .get::<Bool>(RFQPrivateField::UserBuyer.key())
+            .map_err(invalid_fhe)?,
+        claimed: store
+            .get::<Bool>(RFQPrivateField::UserClaimed.key())
+            .map_err(invalid_fhe)?,
+        best_offer: store
+            .get::<Uint<64>>(RFQPrivateField::BestOffer.key())
+            .map_err(invalid_fhe)?,
+        best_maker: store
+            .get::<Uint<64>>(RFQPrivateField::BestMaker.key())
+            .map_err(invalid_fhe)?,
+        size: store
+            .get::<Uint<64>>(RFQPrivateField::Size.key())
+            .map_err(invalid_fhe)?,
+        limit: store
+            .get::<Uint<64>>(RFQPrivateField::OfferLimit.key())
+            .map_err(invalid_fhe)?,
+    });
     let closed_bids = store
         .get::<Uint<64>>(RFQPrivateField::ClosedBids.key())
-        .map_err(invalid_fhe)?;
-    let limit = store
-        .get::<Uint<64>>(RFQPrivateField::OfferLimit.key())
         .map_err(invalid_fhe)?;
     let side = if asset {
         &ctx.accounts.asset
@@ -180,21 +166,8 @@ fn execute_user_payout<'info>(
             .allow(ctx.accounts.user.key()),
     );
     let close_output = Box::new(store.set(RFQPrivateField::CanClose.key()).make_public());
-    let execution = FheExecution::build_returning(store.id(), |fhe| {
-        let not_claimed = fhe.not(claimed)?;
-        let has_winner = fhe.ne(best_maker, Scalar::<Uint<64>>::u64(0))?;
-        let zero = fhe.trivial_encrypt_u64(0)?;
-        let due = if asset {
-            let winning = fhe.if_then_else(buyer, size, zero)?;
-            let no_winner = fhe.if_then_else(buyer, zero, size)?;
-            fhe.if_then_else(has_winner, winning, no_winner)?
-        } else {
-            let buyer_change = fhe.sub(limit, best_offer)?;
-            let winning = fhe.if_then_else(buyer, buyer_change, best_offer)?;
-            let no_winner = fhe.if_then_else(buyer, limit, zero)?;
-            fhe.if_then_else(has_winner, winning, no_winner)?
-        };
-        let payout = fhe.if_then_else(not_claimed, due, zero)?;
+    let execution = FheExecution::build_returning(store.id(), move |fhe| {
+        let payout = user_payout_value(fhe, &inputs, asset)?;
         fhe.output(payout, *payout_output)?;
         if asset {
             let claimed_next = fhe.trivial_encrypt(Scalar::<Bool>::bool(true))?;
@@ -210,7 +183,7 @@ fn execute_user_payout<'info>(
         execution,
         zama_fhe::ExecutionCpiAccounts {
             payer: ctx.accounts.user.to_account_info(),
-            authority: ctx.accounts.rfq_authority.to_account_info(),
+            authority: ctx.accounts.rfq.to_account_info(),
             host_config: ctx.accounts.host_config.to_account_info(),
             deny_scope_records: ctx.remaining_accounts.to_vec(),
             system_program: ctx.accounts.system_program.to_account_info(),
@@ -226,9 +199,41 @@ fn execute_user_payout<'info>(
             ctx.accounts.rfq_store.to_account_info(),
             side.rfq_balance_store.to_account_info(),
         ],
-        [ctx.accounts.rfq_authority.to_account_info()],
+        [ctx.accounts.rfq.to_account_info()],
         &[seeds],
     )
+}
+
+struct UserPayoutInputs {
+    buyer: FheHandle<Bool>,
+    claimed: FheHandle<Bool>,
+    best_offer: FheHandle<Uint<64>>,
+    best_maker: FheHandle<Uint<64>>,
+    size: FheHandle<Uint<64>>,
+    limit: FheHandle<Uint<64>>,
+}
+
+// Keep payout arithmetic in its own SBF frame, separate from execution assembly.
+#[inline(never)]
+fn user_payout_value<'id>(
+    fhe: &mut FheExecutionBuilder<'id>,
+    input: &UserPayoutInputs,
+    asset: bool,
+) -> zama_fhe::Result<Encrypted<'id, Uint<64>>> {
+    let not_claimed = fhe.not(input.claimed)?;
+    let has_winner = fhe.ne(input.best_maker, Scalar::<Uint<64>>::u64(0))?;
+    let zero = fhe.trivial_encrypt_u64(0)?;
+    let due = if asset {
+        let winning = fhe.if_then_else(input.buyer, input.size, zero)?;
+        let no_winner = fhe.if_then_else(input.buyer, zero, input.size)?;
+        fhe.if_then_else(has_winner, winning, no_winner)?
+    } else {
+        let buyer_change = fhe.sub(input.limit, input.best_offer)?;
+        let winning = fhe.if_then_else(input.buyer, buyer_change, input.best_offer)?;
+        let no_winner = fhe.if_then_else(input.buyer, input.limit, zero)?;
+        fhe.if_then_else(has_winner, winning, no_winner)?
+    };
+    fhe.if_then_else(not_claimed, due, zero)
 }
 
 fn invalid_fhe(error: zama_fhe::FheExecutionBuildError) -> anchor_lang::error::Error {

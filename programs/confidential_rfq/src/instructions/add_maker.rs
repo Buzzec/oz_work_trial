@@ -1,9 +1,11 @@
 //! Add one maker and delegate market-group decryption rights to them.
 
-use crate::util::{
-    cpi,
-    market::{add_maker_entry, market_space},
-    pda::{market_maker_group_seeds, market_maker_group_signer_seeds},
+use crate::{
+    state::market::Market,
+    util::{
+        cpi,
+        pda::{market_maker_group_seeds, market_maker_group_signer_seeds},
+    },
 };
 use anchor_lang::prelude::*;
 use zama_host::program::ZamaHost;
@@ -15,11 +17,11 @@ pub struct AddMaker<'info> {
     #[account(
         mut,
         has_one = admin,
-        realloc = market_space(market.makers.len() + 1),
+        realloc = Market::space(market.maker_count() + 1),
         realloc::payer = admin,
         realloc::zero = false,
     )]
-    pub market: Account<'info, crate::state::market::Market>,
+    pub market: Account<'info, Market>,
     /// CHECK: Group PDA
     #[account(seeds = market_maker_group_seeds(&market).as_slice(), bump = market.maker_group_bump)]
     pub maker_group: UncheckedAccount<'info>,
@@ -33,9 +35,8 @@ pub struct AddMaker<'info> {
 }
 
 pub fn add_maker(ctx: Context<AddMaker>, maker_id: u64, maker: Pubkey) -> Result<()> {
-    add_maker_entry(&mut ctx.accounts.market, maker_id, maker)?;
+    ctx.accounts.market.add_maker(maker_id, maker)?;
 
-    let market_key = ctx.accounts.market.key();
     let seeds = &market_maker_group_signer_seeds(&ctx.accounts.market);
 
     cpi::delegate_for_user_decryption(

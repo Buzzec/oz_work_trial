@@ -111,7 +111,7 @@ pub fn transfer_maker_payout<'info>(
     transfer_from_grant(
         ctx.accounts.confidential_token_program.key(),
         ct::cpi::accounts::ConfidentialTransferFromValue {
-            owner: ctx.accounts.rfq_authority.to_account_info(),
+            owner: ctx.accounts.rfq.to_account_info(),
             payer: ctx.accounts.maker.to_account_info(),
             mint: side.confidential_mint.to_account_info(),
             underlying_mint: side.underlying_mint.to_account_info(),
@@ -174,7 +174,7 @@ pub fn transfer_user_payouts<'info>(
         transfer_from_grant(
             ctx.accounts.confidential_token_program.key(),
             ct::cpi::accounts::ConfidentialTransferFromValue {
-                owner: ctx.accounts.rfq_authority.to_account_info(),
+                owner: ctx.accounts.rfq.to_account_info(),
                 payer: ctx.accounts.user.to_account_info(),
                 mint: side.confidential_mint.to_account_info(),
                 underlying_mint: side.underlying_mint.to_account_info(),

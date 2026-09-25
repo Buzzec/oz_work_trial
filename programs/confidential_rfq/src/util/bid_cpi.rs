@@ -3,7 +3,6 @@
 
 use crate::instructions::place_bid::PlaceBid;
 use crate::util::cpi;
-use crate::util::pda::rfq_authority_signer_seeds;
 use anchor_lang::prelude::*;
 use confidential_token as ct;
 use zama_fhe::{ExecutionCpiAccounts, FheExecution, Uint};
@@ -13,17 +12,13 @@ use zama_host::CoprocessorInputAttestation;
 pub(crate) fn invoke_bid_execution<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     execution: FheExecution,
-    rfq_key: Pubkey,
-    nonce: [u8; 32],
-    authority_bump: u8,
+    authority_seeds: &[&[u8]],
 ) -> Result<()> {
-    let bump = [authority_bump];
-    let signer_seeds = &rfq_authority_signer_seeds(&rfq_key, &nonce, &bump);
     cpi::invoke(
         execution,
         ExecutionCpiAccounts {
             payer: ctx.accounts.maker.to_account_info(),
-            authority: ctx.accounts.rfq_authority.to_account_info(),
+            authority: ctx.accounts.rfq.to_account_info(),
             host_config: ctx.accounts.host_config.to_account_info(),
             deny_scope_records: ctx.remaining_accounts.to_vec(),
             system_program: ctx.accounts.system_program.to_account_info(),
@@ -44,8 +39,8 @@ pub(crate) fn invoke_bid_execution<'info>(
             program: ctx.accounts.zama_program.to_account_info(),
         },
         [ctx.accounts.rfq_store.to_account_info()],
-        [ctx.accounts.rfq_authority.to_account_info()],
-        &[signer_seeds],
+        [ctx.accounts.rfq.to_account_info()],
+        &[authority_seeds],
     )
 }
 
@@ -53,9 +48,7 @@ pub(crate) fn invoke_bid_execution<'info>(
 pub(crate) fn invoke_returning_bid_execution<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     execution: zama_fhe::ReturningFheExecution<Uint<64>>,
-    rfq_key: Pubkey,
-    nonce: [u8; 32],
-    authority_bump: u8,
+    authority_seeds: &[&[u8]],
 ) -> Result<[u8; 32]> {
     let mut dynamic = vec![ctx.accounts.rfq_store.to_account_info()];
     for required in execution.execution().dynamic_account_requirements() {
@@ -69,13 +62,11 @@ pub(crate) fn invoke_returning_bid_execution<'info>(
             dynamic.push(ctx.accounts.rfq_basis_balance_store.to_account_info());
         }
     }
-    let bump = [authority_bump];
-    let signer_seeds = &rfq_authority_signer_seeds(&rfq_key, &nonce, &bump);
     cpi::invoke_returning(
         execution,
         ExecutionCpiAccounts {
             payer: ctx.accounts.maker.to_account_info(),
-            authority: ctx.accounts.rfq_authority.to_account_info(),
+            authority: ctx.accounts.rfq.to_account_info(),
             host_config: ctx.accounts.host_config.to_account_info(),
             deny_scope_records: ctx.remaining_accounts.to_vec(),
             system_program: ctx.accounts.system_program.to_account_info(),
@@ -96,8 +87,8 @@ pub(crate) fn invoke_returning_bid_execution<'info>(
             program: ctx.accounts.zama_program.to_account_info(),
         },
         dynamic,
-        [ctx.accounts.rfq_authority.to_account_info()],
-        &[signer_seeds],
+        [ctx.accounts.rfq.to_account_info()],
+        &[authority_seeds],
     )
 }
 
@@ -167,9 +158,7 @@ pub(crate) fn refund_token<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     handle: [u8; 32],
     asset: bool,
-    rfq_key: Pubkey,
-    nonce: [u8; 32],
-    authority_bump: u8,
+    authority_seeds: &[&[u8]],
 ) -> Result<()> {
     let (mint, underlying, maker_ata, rfq_ata, maker_token, rfq_token, maker_store, rfq_balance) =
         if asset {
@@ -195,12 +184,10 @@ pub(crate) fn refund_token<'info>(
                 &ctx.accounts.rfq_basis_balance_store,
             )
         };
-    let bump = [authority_bump];
-    let authority_seeds = &rfq_authority_signer_seeds(&rfq_key, &nonce, &bump);
     cpi::transfer_from_grant(
         ctx.accounts.confidential_token_program.key(),
         ct::cpi::accounts::ConfidentialTransferFromValue {
-            owner: ctx.accounts.rfq_authority.to_account_info(),
+            owner: ctx.accounts.rfq.to_account_info(),
             payer: ctx.accounts.maker.to_account_info(),
             mint: mint.to_account_info(),
             underlying_mint: underlying.to_account_info(),

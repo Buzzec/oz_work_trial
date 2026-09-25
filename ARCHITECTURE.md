@@ -15,13 +15,13 @@
 
 Optional versions of these ids are `u64`s, with `0` representing `None`.
 
-Markets start with an empty maker map. Adding or removing a maker reallocates the account to fit the current membership; the admin pays additional rent on growth and receives the unused rent on shrinkage.
+Markets start with an empty maker vector sorted by ID. The field is private; `Market` methods provide lookup, insertion, removal, and membership counts. Adding or removing a maker reallocates the account to fit the current membership; the admin pays additional rent on growth and receives the unused rent on shrinkage.
 
 | Field            | Type                   | Description                                                                                   |
 |------------------|------------------------|-----------------------------------------------------------------------------------------------|
 | Admin            | `Pubkey`               | The admin for this market.                                                                    |
 | Maker Group Bump | `u8`                   | The bump seed for the maker group's pda                                                       |
-| Makers           | `Map<MakerId, Pubkey>` | Approved makers on the market, these are the ids of the given makers mapped to their pubkeys. |
+| Makers           | `Vec<MakerEntry>`      | Approved makers sorted by nonzero ID, with each entry containing a `u64` ID and a `Pubkey`. |
 
 ## RFQ
 

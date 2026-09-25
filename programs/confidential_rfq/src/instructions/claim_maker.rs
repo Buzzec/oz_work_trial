@@ -11,7 +11,8 @@ use crate::{
     state::rfq::{RFQ, RFQPrivateField},
     util::{
         cpi,
-        pda::bid_receipt_seeds,
+        pda::{bid_receipt_seeds, rfq_state_signer_seeds},
+        rfq::validate_rfq_store,
         token_side::{
             __client_accounts_token_side, __cpi_client_accounts_token_side, TokenSide,
             TokenSideBumps,
@@ -34,15 +35,13 @@ pub struct ClaimRfqMaker<'info> {
     #[account(mut)]
     pub maker: Signer<'info>,
     pub rfq: AccountLoader<'info, RFQ>,
-    /// CHECK: verified against the nonce-bound RFQ PDA and stored bump.
-    pub rfq_authority: UncheckedAccount<'info>,
     #[account(
         mut,
         close = maker,
         seeds = [
-            bid_receipt_seeds(&rfq.key(), &bid_index.to_le_bytes())[0],
-            bid_receipt_seeds(&rfq.key(), &bid_index.to_le_bytes())[1],
-            bid_receipt_seeds(&rfq.key(), &bid_index.to_le_bytes())[2],
+            bid_receipt_seeds(&rfq, &bid_index.to_le_bytes())[0],
+            bid_receipt_seeds(&rfq, &bid_index.to_le_bytes())[1],
+            bid_receipt_seeds(&rfq, &bid_index.to_le_bytes())[2],
         ],
         bump = bid_receipt.bump,
     )]
@@ -81,17 +80,15 @@ pub fn claim_rfq_maker<'info>(
     let id = NonZeroU64::new(maker_id).ok_or(error!(ConfidentialRfqError::InvalidMakerId))?;
     let rfq_key = ctx.accounts.rfq.key();
     let maker = ctx.accounts.maker.key();
-    let (version, bump, bid_count, timeout, asset_mint, basis_mint) = {
-        let rfq = ctx.accounts.rfq.load()?;
-        (
-            rfq.version,
-            rfq.authority_bump,
-            rfq.bid_count,
-            rfq.timeout,
-            rfq.asset_mint,
-            rfq.basis_mint,
-        )
-    };
+    let rfq_state = *ctx.accounts.rfq.load()?;
+    let RFQ {
+        version,
+        bid_count,
+        timeout,
+        asset_mint,
+        basis_mint,
+        ..
+    } = rfq_state;
     require_eq!(
         version,
         RFQ::VERSION,
@@ -107,26 +104,12 @@ pub fn claim_rfq_maker<'info>(
             && ctx.accounts.bid_receipt.maker == maker,
         ConfidentialRfqError::UnauthorizedMaker
     );
-    let (authority, canonical_bump) = rfq_authority_address(&rfq_key, &nonce);
-    require_eq!(
-        canonical_bump,
-        bump,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    require_keys_eq!(
-        ctx.accounts.rfq_authority.key(),
-        authority,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    let (store_key, store_bump) = zama_host::encrypted_store_address(crate::ID, authority, nonce);
-    require!(
-        ctx.accounts.rfq_store.key() == store_key
-            && ctx.accounts.rfq_store.program == crate::ID
-            && ctx.accounts.rfq_store.authority == authority
-            && ctx.accounts.rfq_store.scope == nonce
-            && ctx.accounts.rfq_store.bump == store_bump,
-        ConfidentialRfqError::RfqStoreMismatch
-    );
+    validate_rfq_store(
+        rfq_key,
+        &rfq_state,
+        ctx.accounts.rfq_store.key(),
+        &ctx.accounts.rfq_store,
+    )?;
     for (side, mint) in [
         (&ctx.accounts.asset, asset_mint),
         (&ctx.accounts.basis, basis_mint),
@@ -142,7 +125,7 @@ pub fn claim_rfq_maker<'info>(
             ConfidentialRfqError::MintMismatch
         );
         for (owner, token, store) in [
-            (authority, &side.rfq_token_account, &side.rfq_balance_store),
+            (rfq_key, &side.rfq_token_account, &side.rfq_balance_store),
             (
                 maker,
                 &side.participant_token_account,
@@ -167,8 +150,8 @@ pub fn claim_rfq_maker<'info>(
         Clock::get()?.unix_timestamp >= timeout,
         ConfidentialRfqError::RfqNotExpired
     );
-    let bump_seed = [bump];
-    let authority_seeds = &rfq_authority_signer_seeds(&rfq_key, &nonce, &bump_seed);
+    let nonce = ctx.accounts.rfq_store.scope;
+    let authority_seeds = &rfq_state_signer_seeds(&rfq_state, &nonce);
     let asset_balance_store_id = StoreId::new(
         ct::ID,
         ctx.accounts.asset.rfq_token_account.key(),
@@ -194,7 +177,7 @@ pub fn claim_rfq_maker<'info>(
             ctx.accounts.rfq_store.to_account_info(),
             ctx.accounts.asset.rfq_balance_store.to_account_info(),
         ],
-        [ctx.accounts.rfq_authority.to_account_info()],
+        [ctx.accounts.rfq.to_account_info()],
         &[authority_seeds],
     )?;
     cpi::transfer_maker_payout(&ctx, authority_seeds, asset_handle, cpi::PayoutToken::Asset)?;
@@ -216,7 +199,7 @@ pub fn claim_rfq_maker<'info>(
             ctx.accounts.rfq_store.to_account_info(),
             ctx.accounts.basis.rfq_balance_store.to_account_info(),
         ],
-        [ctx.accounts.rfq_authority.to_account_info()],
+        [ctx.accounts.rfq.to_account_info()],
         &[authority_seeds],
     )?;
     cpi::transfer_maker_payout(&ctx, authority_seeds, basis_handle, cpi::PayoutToken::Basis)?;
@@ -380,7 +363,7 @@ fn execution_accounts<'info>(
 ) -> ExecutionCpiAccounts<'info> {
     ExecutionCpiAccounts {
         payer: ctx.accounts.maker.to_account_info(),
-        authority: ctx.accounts.rfq_authority.to_account_info(),
+        authority: ctx.accounts.rfq.to_account_info(),
         host_config: ctx.accounts.host_config.to_account_info(),
         deny_scope_records: ctx.remaining_accounts.to_vec(),
         system_program: ctx.accounts.system_program.to_account_info(),
@@ -425,7 +408,6 @@ mod packet_tests {
         let accounts = crate::accounts::ClaimRfqMaker {
             maker,
             rfq: next(),
-            rfq_authority: next(),
             bid_receipt: next(),
             rfq_store: next(),
             asset: crate::accounts::TokenSide {

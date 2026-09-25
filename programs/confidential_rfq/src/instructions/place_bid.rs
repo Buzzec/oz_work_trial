@@ -11,7 +11,8 @@ use crate::state::rfq::{RFQ, RFQPrivateField};
 use crate::util::bid_cpi::{
     invoke_bid_execution, invoke_returning_bid_execution, refund_token, transfer_token,
 };
-use crate::util::pda::{bid_receipt_seeds, rfq_authority_address};
+use crate::util::pda::{bid_receipt_seeds, rfq_state_signer_seeds};
+use crate::util::rfq::validate_rfq_store;
 use crate::{ConfidentialRfqError, CurrentAccountVersion};
 use anchor_lang::prelude::*;
 use confidential_token as ct;
@@ -42,16 +43,14 @@ pub struct PlaceBid<'info> {
     pub market: Box<Account<'info, Market>>,
     #[account(mut)]
     pub rfq: AccountLoader<'info, RFQ>,
-    /// CHECK: validated against the nonce-bound PDA and stored bump below.
-    pub rfq_authority: UncheckedAccount<'info>,
     #[account(
         init,
         payer = maker,
         space = 8 + BidReceipt::SPACE,
         seeds = [
-            bid_receipt_seeds(&rfq.key(), &rfq.load()?.bid_count.to_le_bytes())[0],
-            bid_receipt_seeds(&rfq.key(), &rfq.load()?.bid_count.to_le_bytes())[1],
-            bid_receipt_seeds(&rfq.key(), &rfq.load()?.bid_count.to_le_bytes())[2],
+            bid_receipt_seeds(&rfq, &rfq.load()?.bid_count.to_le_bytes())[0],
+            bid_receipt_seeds(&rfq, &rfq.load()?.bid_count.to_le_bytes())[1],
+            bid_receipt_seeds(&rfq, &rfq.load()?.bid_count.to_le_bytes())[2],
         ],
         bump,
     )]
@@ -137,28 +136,16 @@ pub fn place_bid<'info>(
     let id = NonZeroU64::new(maker_id).ok_or(error!(ConfidentialRfqError::InvalidMakerId))?;
     let rfq_key = ctx.accounts.rfq.key();
     let maker_key = ctx.accounts.maker.key();
-    let (
-        rfq_version,
-        rfq_market,
-        nonce,
-        authority_bump,
+    let rfq_state = *ctx.accounts.rfq.load()?;
+    let RFQ {
+        version: rfq_version,
+        market: rfq_market,
         bid_count,
         timeout,
         asset_mint,
         basis_mint,
-    ) = {
-        let rfq = ctx.accounts.rfq.load()?;
-        (
-            rfq.version,
-            rfq.market,
-            rfq.nonce,
-            rfq.authority_bump,
-            rfq.bid_count,
-            rfq.timeout,
-            rfq.asset_mint,
-            rfq.basis_mint,
-        )
-    };
+        ..
+    } = rfq_state;
     require_eq!(
         rfq_version,
         RFQ::VERSION,
@@ -179,12 +166,7 @@ pub fn place_bid<'info>(
         ConfidentialRfqError::MarketMismatch
     );
     require_keys_eq!(
-        ctx.accounts
-            .market
-            .makers
-            .get(&id)
-            .copied()
-            .unwrap_or_default(),
+        ctx.accounts.market.maker(maker_id).unwrap_or_default(),
         maker_key,
         ConfidentialRfqError::UnauthorizedMaker
     );
@@ -212,30 +194,15 @@ pub fn place_bid<'info>(
         ConfidentialRfqError::MintMismatch
     );
 
-    let (authority, canonical_bump) = rfq_authority_address(&rfq_key, &nonce);
-    require_eq!(
-        canonical_bump,
-        authority_bump,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    require_keys_eq!(
-        ctx.accounts.rfq_authority.key(),
-        authority,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    let store_id = StoreId::new(crate::ID, authority, nonce);
-    require_keys_eq!(
+    validate_rfq_store(
+        rfq_key,
+        &rfq_state,
         ctx.accounts.rfq_store.key(),
-        store_id.address(),
-        ConfidentialRfqError::RfqStoreMismatch
-    );
-    require!(
-        ctx.accounts.rfq_store.program == crate::ID
-            && ctx.accounts.rfq_store.authority == authority
-            && ctx.accounts.rfq_store.scope == nonce,
-        ConfidentialRfqError::RfqStoreMismatch
-    );
-    check_token_accounts(&ctx, asset_mint, basis_mint, authority)?;
+        &ctx.accounts.rfq_store,
+    )?;
+    let nonce = ctx.accounts.rfq_store.scope;
+    let authority_seeds = &rfq_state_signer_seeds(&rfq_state, &nonce);
+    check_token_accounts(&ctx, asset_mint, basis_mint, rfq_key)?;
 
     for field in [
         RFQPrivateField::MakerBuy(id),
@@ -259,26 +226,17 @@ pub fn place_bid<'info>(
     let actual_basis = transfer_token(&ctx, basis_transfer_attestation, false)?;
     ctx.accounts.rfq_store.reload()?;
 
-    record_prices(&ctx, id, prices, rfq_key, nonce, authority_bump)?;
+    record_prices(&ctx, id, prices, authority_seeds)?;
     ctx.accounts.rfq_store.reload()?;
-    validate_asset_collateral(&ctx, id, actual_asset, rfq_key, nonce, authority_bump)?;
+    validate_asset_collateral(&ctx, id, actual_asset, authority_seeds)?;
     ctx.accounts.rfq_store.reload()?;
-    validate_basis_collateral(&ctx, id, actual_basis, rfq_key, nonce, authority_bump)?;
+    validate_basis_collateral(&ctx, id, actual_basis, authority_seeds)?;
     ctx.accounts.rfq_store.reload()?;
-    let asset_refund =
-        select_best_and_refund_asset(&ctx, id, actual_asset, rfq_key, nonce, authority_bump)?;
-    refund_token(&ctx, asset_refund, true, rfq_key, nonce, authority_bump)?;
+    let asset_refund = select_best_and_refund_asset(&ctx, id, actual_asset, authority_seeds)?;
+    refund_token(&ctx, asset_refund, true, authority_seeds)?;
     ctx.accounts.rfq_store.reload()?;
-    let basis_refund = finalize_bid(
-        &ctx,
-        id,
-        actual_basis,
-        rfq_key,
-        nonce,
-        authority_bump,
-        bid_count,
-    )?;
-    refund_token(&ctx, basis_refund, false, rfq_key, nonce, authority_bump)?;
+    let basis_refund = finalize_bid(&ctx, id, actual_basis, authority_seeds, bid_count)?;
+    refund_token(&ctx, basis_refund, false, authority_seeds)?;
 
     ctx.accounts.bid_receipt.set_inner(BidReceipt {
         rfq: rfq_key,
@@ -298,9 +256,7 @@ fn record_prices<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     id: NonZeroU64,
     prices_attestation: CoprocessorInputAttestation,
-    rfq_key: Pubkey,
-    nonce: [u8; 32],
-    authority_bump: u8,
+    authority_seeds: &[&[u8]],
 ) -> Result<()> {
     let state = Store::new(&ctx.accounts.rfq_store);
     let maker = ctx.accounts.maker.key();
@@ -320,18 +276,15 @@ fn record_prices<'info>(
         Ok(())
     })
     .map_err(invalid_fhe)?;
-    invoke_bid_execution(ctx, execution, rfq_key, nonce, authority_bump)
+    invoke_bid_execution(ctx, execution, authority_seeds)
 }
 
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn validate_asset_collateral<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     id: NonZeroU64,
     actual_asset: [u8; 32],
-    rfq_key: Pubkey,
-    nonce: [u8; 32],
-    authority_bump: u8,
+    authority_seeds: &[&[u8]],
 ) -> Result<()> {
     let state = Store::new(&ctx.accounts.rfq_store);
     let size = state
@@ -364,18 +317,15 @@ fn validate_asset_collateral<'info>(
         Ok(())
     })
     .map_err(invalid_fhe)?;
-    invoke_bid_execution(ctx, execution, rfq_key, nonce, authority_bump)
+    invoke_bid_execution(ctx, execution, authority_seeds)
 }
 
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn validate_basis_collateral<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     id: NonZeroU64,
     actual_basis: [u8; 32],
-    rfq_key: Pubkey,
-    nonce: [u8; 32],
-    authority_bump: u8,
+    authority_seeds: &[&[u8]],
 ) -> Result<()> {
     let execution = build_basis_collateral_execution(
         &ctx.accounts.rfq_store,
@@ -383,7 +333,7 @@ fn validate_basis_collateral<'info>(
         actual_basis,
         ctx.accounts.maker.key(),
     )?;
-    invoke_bid_execution(ctx, execution, rfq_key, nonce, authority_bump)
+    invoke_bid_execution(ctx, execution, authority_seeds)
 }
 
 // Kept in its own SBF stack frame so FHE construction does not share a frame
@@ -435,14 +385,11 @@ fn build_basis_collateral_execution(
 }
 
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn select_best_and_refund_asset<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     id: NonZeroU64,
     actual_asset: [u8; 32],
-    rfq_key: Pubkey,
-    nonce: [u8; 32],
-    authority_bump: u8,
+    authority_seeds: &[&[u8]],
 ) -> Result<[u8; 32]> {
     let state = Store::new(&ctx.accounts.rfq_store);
     let user_buyer = state
@@ -488,18 +435,15 @@ fn select_best_and_refund_asset<'info>(
         Ok(refund_asset)
     })
     .map_err(invalid_fhe)?;
-    invoke_returning_bid_execution(ctx, execution, rfq_key, nonce, authority_bump)
+    invoke_returning_bid_execution(ctx, execution, authority_seeds)
 }
 
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn finalize_bid<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     id: NonZeroU64,
     actual_basis: [u8; 32],
-    rfq_key: Pubkey,
-    nonce: [u8; 32],
-    authority_bump: u8,
+    authority_seeds: &[&[u8]],
     bid_count: u64,
 ) -> Result<[u8; 32]> {
     let basis_store = StoreId::new(
@@ -517,7 +461,7 @@ fn finalize_bid<'info>(
         basis_store,
         next_bid_count,
     )?;
-    invoke_returning_bid_execution(ctx, execution, rfq_key, nonce, authority_bump)
+    invoke_returning_bid_execution(ctx, execution, authority_seeds)
 }
 
 // Separating the FHE builder from the returning CPI avoids SBF stack-frame
@@ -649,7 +593,6 @@ mod tests {
             maker,
             market: next(),
             rfq: next(),
-            rfq_authority: next(),
             bid_receipt: next(),
             rfq_store: next(),
             asset_confidential_mint: next(),

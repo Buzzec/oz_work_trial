@@ -1,5 +1,5 @@
 use anchor_lang::{AccountDeserialize, prelude::*};
-use confidential_rfq::{accounts, instruction, state::market::Market, util::pda};
+use confidential_rfq::{accounts, instruction, state::market::Market};
 use mollusk_svm::{Mollusk, result::Check};
 use solana_sdk::{account::Account as SolanaAccount, instruction::Instruction};
 use zama_solana_test_kit::{
@@ -34,7 +34,7 @@ fn assert_market_size(
 ) {
     let account = account(accounts, key);
     let market = Market::try_deserialize(&mut account.data.as_slice()).unwrap();
-    assert_eq!(market.makers.len(), maker_count);
+    assert_eq!(market.maker_count(), maker_count);
     assert_eq!(account.data.len(), 46 + 40 * maker_count);
     assert_eq!(
         account.lamports,
@@ -51,7 +51,10 @@ fn market_reallocates_and_refunds_rent_as_makers_change() {
 
     let admin = Pubkey::new_unique();
     let market = Pubkey::new_unique();
-    let (maker_group, _) = pda::market_maker_group_address(&market);
+    let (maker_group, _) = Pubkey::find_program_address(
+        &[b"market_maker_group", market.as_ref()],
+        &confidential_rfq::ID,
+    );
     let (host_config, host_config_data) = host_config_account(&HostConfigParams::new(admin));
     let mut accounts = vec![
         (admin, funded_system_account()),
@@ -79,9 +82,9 @@ fn market_reallocates_and_refunds_rent_as_makers_change() {
     );
     assert_market_size(&svm, &accounts, market, 0);
 
-    let makers = [Pubkey::new_unique(), Pubkey::new_unique()];
+    let makers = [(2, Pubkey::new_unique()), (1, Pubkey::new_unique())];
     let wildcard = Pubkey::new_from_array(zama_host::WILDCARD_AUTHORITY_BYTES);
-    for (index, maker) in makers.iter().copied().enumerate() {
+    for (index, (maker_id, maker)) in makers.iter().copied().enumerate() {
         let delegation_record =
             zama_host::user_decryption_delegation_address(maker_group, maker, wildcard).0;
         accounts.push((delegation_record, empty_system_account()));
@@ -100,14 +103,14 @@ fn market_reallocates_and_refunds_rent_as_makers_change() {
                     zama_program: zama_host::ID,
                     system_program: System::id(),
                 },
-                instruction::AddMaker {
-                    maker_id: index as u64 + 1,
-                    maker,
-                },
+                instruction::AddMaker { maker_id, maker },
             ),
             &mut accounts,
         );
         assert_market_size(&svm, &accounts, market, index + 1);
+        let state =
+            Market::try_deserialize(&mut account(&accounts, market).data.as_slice()).unwrap();
+        assert_eq!(state.maker(maker_id), Some(maker));
         assert_eq!(
             admin_before - account(&accounts, admin).lamports,
             account(&accounts, market).lamports - rent_before
@@ -124,7 +127,7 @@ fn market_reallocates_and_refunds_rent_as_makers_change() {
 
     // The host requires revocation to occur after the grant's slot.
     svm.warp_to_slot(101);
-    for (index, maker) in makers.iter().copied().enumerate().rev() {
+    for (index, (maker_id, maker)) in makers.iter().copied().enumerate().rev() {
         let delegation_record =
             zama_host::user_decryption_delegation_address(maker_group, maker, wildcard).0;
         let admin_before = account(&accounts, admin).lamports;
@@ -142,13 +145,14 @@ fn market_reallocates_and_refunds_rent_as_makers_change() {
                     zama_program: zama_host::ID,
                     system_program: System::id(),
                 },
-                instruction::RemoveMaker {
-                    maker_id: index as u64 + 1,
-                },
+                instruction::RemoveMaker { maker_id },
             ),
             &mut accounts,
         );
         assert_market_size(&svm, &accounts, market, index);
+        let state =
+            Market::try_deserialize(&mut account(&accounts, market).data.as_slice()).unwrap();
+        assert_eq!(state.maker(maker_id), None);
         assert_eq!(
             account(&accounts, admin).lamports - admin_before,
             rent_before - account(&accounts, market).lamports

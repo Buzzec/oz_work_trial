@@ -1,7 +1,6 @@
 pub mod market;
 pub mod rfq;
 
-use crate::ConfidentialRfqError;
 use anchor_lang::prelude::*;
 use std::num::NonZeroU64;
 

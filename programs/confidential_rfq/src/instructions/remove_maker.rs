@@ -1,9 +1,11 @@
 //! Remove one maker and revoke their market-group decryption rights.
 
-use crate::util::{
-    cpi,
-    market::{market_space, remove_maker_entry},
-    pda::{market_maker_group_seeds, market_maker_group_signer_seeds},
+use crate::{
+    state::market::Market,
+    util::{
+        cpi,
+        pda::{market_maker_group_seeds, market_maker_group_signer_seeds},
+    },
 };
 use anchor_lang::prelude::*;
 use zama_host::program::ZamaHost;
@@ -15,11 +17,11 @@ pub struct RemoveMaker<'info> {
     #[account(
         mut,
         has_one = admin,
-        realloc = market_space(market.makers.len().saturating_sub(1)),
+        realloc = Market::space(market.maker_count().saturating_sub(1)),
         realloc::payer = admin,
         realloc::zero = false,
     )]
-    pub market: Account<'info, crate::state::market::Market>,
+    pub market: Account<'info, Market>,
     /// CHECK: canonical market group PDA; signs the host revocation CPI.
     #[account(seeds = market_maker_group_seeds(&market).as_slice(), bump = market.maker_group_bump)]
     pub maker_group: UncheckedAccount<'info>,
@@ -32,7 +34,7 @@ pub struct RemoveMaker<'info> {
 }
 
 pub fn remove_maker(ctx: Context<RemoveMaker>, maker_id: u64) -> Result<()> {
-    remove_maker_entry(&mut ctx.accounts.market, maker_id)?;
+    ctx.accounts.market.remove_maker(maker_id)?;
 
     let seeds = &market_maker_group_signer_seeds(&ctx.accounts.market);
 

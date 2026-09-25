@@ -4,10 +4,7 @@ use crate::state::{
     CurrentAccountVersion,
     rfq::{RFQ, RFQPrivateField},
 };
-use crate::util::{
-    close_rfq_cpi,
-    pda::{bid_receipt_address, rfq_authority_address},
-};
+use crate::util::{close_rfq_cpi, pda::bid_receipt_address, rfq::validate_rfq_store};
 use anchor_lang::prelude::*;
 use zama_host::{
     EncryptedStore, HostConfig, KmsContext, instructions::MmrInclusionProof, program::ZamaHost,
@@ -91,7 +88,7 @@ pub fn close_rfq<'info>(
         );
         let index =
             u64::try_from(index).map_err(|_| error!(ConfidentialRfqError::InvalidRfqAccounts))?;
-        let (expected_receipt, expected_bump) = bid_receipt_address(&rfq_key, index);
+        let (expected_receipt, expected_bump) = bid_receipt_address(&ctx.accounts.rfq, index);
         require_keys_eq!(
             receipt_info.key(),
             expected_receipt,
@@ -134,22 +131,8 @@ fn current_can_close_handle(
         rfq.version == RFQ::VERSION,
         ConfidentialRfqError::InvalidRfqVersion
     );
-    let (authority, authority_bump) = rfq_authority_address(&rfq_key, &rfq.nonce);
-    require!(
-        rfq.authority_bump == authority_bump,
-        ConfidentialRfqError::InvalidEncryptedStore
-    );
-    let scope = rfq.nonce;
-    let (expected_store_key, expected_store_bump) =
-        zama_host::encrypted_store_address(crate::ID, authority, scope);
-    require!(
-        encrypted_store_key == expected_store_key
-            && encrypted_store.program == crate::ID
-            && encrypted_store.authority == authority
-            && encrypted_store.scope == scope
-            && encrypted_store.bump == expected_store_bump,
-        ConfidentialRfqError::InvalidEncryptedStore
-    );
+    validate_rfq_store(rfq_key, rfq, encrypted_store_key, encrypted_store)
+        .map_err(|_| error!(ConfidentialRfqError::InvalidEncryptedStore))?;
     encrypted_store
         .get(&RFQPrivateField::CanClose.key())
         .ok_or(error!(ConfidentialRfqError::CanCloseMissing))
@@ -159,6 +142,7 @@ fn current_can_close_handle(
 mod tests {
     use super::*;
     use crate::util::close_rfq_cpi::{bool_true_cleartext, verify_close_result};
+    use crate::util::pda::{rfq_seeds_from_keys, rfq_state_signer_seeds};
     use anchor_lang::{InstructionData, ToAccountMetas};
     use solana_sdk::{
         hash::Hash,
@@ -169,19 +153,19 @@ mod tests {
     use zama_host::instructions::PublicDecryptReturnData;
 
     fn fixture() -> (Pubkey, RFQ, Pubkey, EncryptedStore, [u8; 32]) {
-        let rfq_key = Pubkey::new_unique();
+        let market = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
         let nonce = [7; 32];
-        let (authority, authority_bump) = rfq_authority_address(&rfq_key, &nonce);
+        let (rfq_key, bump) =
+            Pubkey::find_program_address(&rfq_seeds_from_keys(&market, &user, &nonce), &crate::ID);
         let scope = nonce;
-        let (store_key, store_bump) =
-            zama_host::encrypted_store_address(crate::ID, authority, scope);
+        let (store_key, store_bump) = zama_host::encrypted_store_address(crate::ID, rfq_key, scope);
         let handle = [9; 32];
         let rfq = RFQ {
             version: RFQ::VERSION,
-            market: Pubkey::new_unique(),
-            nonce,
-            authority_bump,
-            user: Pubkey::new_unique(),
+            market,
+            user,
+            bump,
             timeout: 1_000,
             bid_count: 0,
             asset_mint: Pubkey::new_unique(),
@@ -189,7 +173,7 @@ mod tests {
         };
         let store = EncryptedStore {
             program: crate::ID,
-            authority,
+            authority: rfq_key,
             scope,
             slots: vec![EncryptedSlot {
                 key: RFQPrivateField::CanClose.key(),
@@ -210,12 +194,41 @@ mod tests {
             handle
         );
         assert!(current_can_close_handle(Pubkey::new_unique(), &rfq, store_key, &store).is_err());
-        let mut replacement = fixture().1;
-        replacement.nonce = [8; 32];
+        let mut replacement = rfq;
+        replacement.user = Pubkey::new_unique();
+        assert!(current_can_close_handle(key, &replacement, store_key, &store).is_err());
+        replacement = rfq;
+        replacement.market = Pubkey::new_unique();
+        assert!(current_can_close_handle(key, &replacement, store_key, &store).is_err());
+        replacement = rfq;
+        replacement.bump = rfq.bump.wrapping_add(1);
         assert!(current_can_close_handle(key, &replacement, store_key, &store).is_err());
         let mut wrong_slot = store;
         wrong_slot.slots[0].key = RFQPrivateField::UserClaimed.key();
         assert!(current_can_close_handle(key, &rfq, store_key, &wrong_slot).is_err());
+    }
+
+    #[test]
+    fn store_scope_recovers_the_rfq_signer_and_rejects_other_stores() {
+        let (key, rfq, store_key, store, _) = fixture();
+        assert_eq!(
+            Pubkey::create_program_address(&rfq_state_signer_seeds(&rfq, &store.scope), &crate::ID)
+                .unwrap(),
+            key
+        );
+        assert!(current_can_close_handle(key, &rfq, Pubkey::new_unique(), &store).is_err());
+        let mut wrong_store = store.clone();
+        wrong_store.scope = [8; 32];
+        assert!(current_can_close_handle(key, &rfq, store_key, &wrong_store).is_err());
+        wrong_store = store.clone();
+        wrong_store.authority = Pubkey::new_unique();
+        assert!(current_can_close_handle(key, &rfq, store_key, &wrong_store).is_err());
+        wrong_store = store.clone();
+        wrong_store.program = Pubkey::new_unique();
+        assert!(current_can_close_handle(key, &rfq, store_key, &wrong_store).is_err());
+        wrong_store = store.clone();
+        wrong_store.bump = store.bump.wrapping_add(1);
+        assert!(current_can_close_handle(key, &rfq, store_key, &wrong_store).is_err());
     }
 
     #[test]
@@ -248,7 +261,11 @@ mod tests {
         };
         let mut metas = accounts.to_account_metas(None);
         for index in 0_u64..12 {
-            let receipt = bid_receipt_address(&rfq, index).0;
+            let receipt = Pubkey::find_program_address(
+                &[b"bid_receipt", rfq.as_ref(), &index.to_le_bytes()],
+                &crate::ID,
+            )
+            .0;
             metas.push(AccountMeta::new(receipt, false));
             metas.push(AccountMeta::new(next(), false));
         }
