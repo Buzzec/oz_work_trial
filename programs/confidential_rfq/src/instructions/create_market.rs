@@ -1,8 +1,9 @@
 //! Create an admin-owned market with an empty maker map.
 
-use crate::state::{CurrentAccountVersion, market::Market};
-use crate::util::market::market_space;
-use crate::util::pda::market_maker_group_address;
+use crate::{
+    state::{CurrentAccountVersion, market::Market},
+    util::{market::market_space, pda::market_maker_group_address},
+};
 use anchor_lang::prelude::*;
 use std::collections::BTreeMap;
 
@@ -17,7 +18,7 @@ pub struct CreateMarket<'info> {
 }
 
 pub fn create_market(ctx: Context<CreateMarket>) -> Result<()> {
-    let (_, maker_group_bump) = market_maker_group_address(&ctx.accounts.market.key());
+    let (_, maker_group_bump) = market_maker_group_address(&ctx.accounts.market);
     ctx.accounts.market.set_inner(Market {
         version: Market::VERSION,
         admin: ctx.accounts.admin.key(),

@@ -5,14 +5,19 @@
 //! the encrypted act-once marker. Both payouts use transient grants to the
 //! confidential token balance Stores, so no payout slots are left in the RFQ.
 
-use crate::instructions::place_bid::BidReceipt;
-use crate::state::rfq::{RFQ, RFQPrivateField};
-use crate::util::cpi;
-use crate::util::pda::{bid_receipt_seeds, rfq_authority_address, rfq_authority_signer_seeds};
-use crate::util::token_side::{
-    __client_accounts_token_side, __cpi_client_accounts_token_side, TokenSide, TokenSideBumps,
+use crate::{
+    ConfidentialRfqError, CurrentAccountVersion,
+    instructions::place_bid::BidReceipt,
+    state::rfq::{RFQ, RFQPrivateField},
+    util::{
+        cpi,
+        pda::bid_receipt_seeds,
+        token_side::{
+            __client_accounts_token_side, __cpi_client_accounts_token_side, TokenSide,
+            TokenSideBumps,
+        },
+    },
 };
-use crate::{ConfidentialRfqError, CurrentAccountVersion};
 use anchor_lang::prelude::*;
 use confidential_token as ct;
 use std::num::NonZeroU64;
@@ -76,11 +81,10 @@ pub fn claim_rfq_maker<'info>(
     let id = NonZeroU64::new(maker_id).ok_or(error!(ConfidentialRfqError::InvalidMakerId))?;
     let rfq_key = ctx.accounts.rfq.key();
     let maker = ctx.accounts.maker.key();
-    let (version, nonce, bump, bid_count, timeout, asset_mint, basis_mint) = {
+    let (version, bump, bid_count, timeout, asset_mint, basis_mint) = {
         let rfq = ctx.accounts.rfq.load()?;
         (
             rfq.version,
-            rfq.nonce,
             rfq.authority_bump,
             rfq.bid_count,
             rfq.timeout,

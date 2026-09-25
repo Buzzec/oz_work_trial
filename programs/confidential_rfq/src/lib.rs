@@ -42,11 +42,11 @@ pub mod confidential_rfq {
     ) -> Result<()> {
         instructions::request_quote::request_quote(
             ctx,
-            amounts,
-            user_buyer,
+            Box::new(amounts),
+            Box::new(user_buyer),
             timeout,
-            asset_escrow,
-            basis_escrow,
+            Box::new(asset_escrow),
+            Box::new(basis_escrow),
         )
     }
 

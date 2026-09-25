@@ -21,7 +21,7 @@ pub struct AddMaker<'info> {
     )]
     pub market: Account<'info, crate::state::market::Market>,
     /// CHECK: Group PDA
-    #[account(seeds = market_maker_group_seeds(market.to_account_info().key).as_slice(), bump = market.maker_group_bump)]
+    #[account(seeds = market_maker_group_seeds(&market).as_slice(), bump = market.maker_group_bump)]
     pub maker_group: UncheckedAccount<'info>,
     /// CHECK: Checked by CPI
     pub host_config: UncheckedAccount<'info>,
@@ -36,8 +36,7 @@ pub fn add_maker(ctx: Context<AddMaker>, maker_id: u64, maker: Pubkey) -> Result
     add_maker_entry(&mut ctx.accounts.market, maker_id, maker)?;
 
     let market_key = ctx.accounts.market.key();
-    let seeds =
-        &market_maker_group_signer_seeds(&market_key, &ctx.accounts.market.maker_group_bump);
+    let seeds = &market_maker_group_signer_seeds(&ctx.accounts.market);
 
     cpi::delegate_for_user_decryption(
         ctx.accounts.zama_program.key(),

@@ -1,4 +1,8 @@
-use crate::state::{CurrentAccountVersion, MakerId};
+use crate::{
+    ConfidentialRfqError,
+    state::{CurrentAccountVersion, MakerId},
+    util::pda::market_maker_group_signer_seeds,
+};
 use anchor_lang::prelude::*;
 use std::collections::BTreeMap;
 
@@ -15,5 +19,15 @@ impl CurrentAccountVersion for Market {
 
     fn version(&self) -> u8 {
         self.version
+    }
+}
+
+pub trait MarketExt {
+    fn maker_group(&self) -> Result<Pubkey>;
+}
+impl<'info> MarketExt for Account<'info, Market> {
+    fn maker_group(&self) -> Result<Pubkey> {
+        Pubkey::create_program_address(&market_maker_group_signer_seeds(self), &crate::ID)
+            .map_err(|_| error!(ConfidentialRfqError::InvalidRfqAccounts))
     }
 }

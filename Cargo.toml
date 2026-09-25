@@ -12,5 +12,6 @@ publish = false
 [workspace.dependencies]
 anchor-lang = "1.2.0"
 bytemuck = "1.25.2"
+derive_more = { version = "2.1.1", features = ["full"] }
 zama-fhe = { path = "zama/solana/crates/zama-fhe", version = "0.1.0" }
 zama-host = { path = "zama/solana/programs/zama-host", version = "0.1.0" }

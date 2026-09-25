@@ -4,13 +4,12 @@ use std::num::NonZeroU64;
 
 #[account(zero_copy)]
 #[repr(C, packed)]
+#[derive(InitSpace)]
 pub struct RFQ {
     pub version: u8,
     pub market: Pubkey,
-    /// Should be randomly derived from slot-hashes
-    pub nonce: [u8; 32],
-    pub authority_bump: u8,
     pub user: Pubkey,
+    pub bump: u8,
     pub timeout: i64,
     pub bid_count: u64,
     pub asset_mint: Pubkey,

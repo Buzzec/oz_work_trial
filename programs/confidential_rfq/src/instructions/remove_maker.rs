@@ -21,7 +21,7 @@ pub struct RemoveMaker<'info> {
     )]
     pub market: Account<'info, crate::state::market::Market>,
     /// CHECK: canonical market group PDA; signs the host revocation CPI.
-    #[account(seeds = market_maker_group_seeds(market.to_account_info().key).as_slice(), bump = market.maker_group_bump)]
+    #[account(seeds = market_maker_group_seeds(&market).as_slice(), bump = market.maker_group_bump)]
     pub maker_group: UncheckedAccount<'info>,
     pub host_config: Box<Account<'info, zama_host::HostConfig>>,
     /// CHECK: canonical host delegation PDA, checked by host CPI.
@@ -34,9 +34,7 @@ pub struct RemoveMaker<'info> {
 pub fn remove_maker(ctx: Context<RemoveMaker>, maker_id: u64) -> Result<()> {
     remove_maker_entry(&mut ctx.accounts.market, maker_id)?;
 
-    let market_key = ctx.accounts.market.key();
-    let seeds =
-        &market_maker_group_signer_seeds(&market_key, &ctx.accounts.market.maker_group_bump);
+    let seeds = &market_maker_group_signer_seeds(&ctx.accounts.market);
 
     cpi::revoke_delegation_for_user_decryption(
         ctx.accounts.zama_program.key(),
