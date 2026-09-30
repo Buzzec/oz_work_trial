@@ -1,4 +1,4 @@
-//! Host public-decrypt verification for RFQ closure.
+//! Host public-decrypt verification before RFQ account closure.
 
 use anchor_lang::{prelude::*, solana_program::program::get_return_data};
 use zama_host::instructions::{MmrInclusionProof, PublicDecryptReturnData};
@@ -53,4 +53,26 @@ pub(crate) fn verify_close_result(
         ConfidentialRfqError::RfqNotClosable
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returned_certificate_must_come_from_host_and_match_current_true_handle() {
+        let handle = [9; 32];
+        let mut returned = PublicDecryptReturnData {
+            handle,
+            cleartext: bool_true_cleartext(),
+            context_id: [3; 32],
+        };
+        verify_close_result(zama_host::ID, handle, &returned).unwrap();
+        assert!(verify_close_result(Pubkey::new_unique(), handle, &returned).is_err());
+        assert!(verify_close_result(zama_host::ID, [4; 32], &returned).is_err());
+        returned.cleartext = [0; 32];
+        assert!(verify_close_result(zama_host::ID, handle, &returned).is_err());
+        returned.cleartext[31] = 2;
+        assert!(verify_close_result(zama_host::ID, handle, &returned).is_err());
+    }
 }

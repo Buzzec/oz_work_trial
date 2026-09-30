@@ -1,474 +1,384 @@
-//! Settle one maker's bid after the public RFQ timeout.
-//!
-//! Failed bids are refunded and counted closed during placement. A live bid has
-//! a positive MakerBuy value; setting MakerBuy and MakerSell to zero on claim is
-//! the encrypted act-once marker. Both payouts use transient grants to the
-//! confidential token balance Stores, so no payout slots are left in the RFQ.
+//! Permissionless settlement of one maker's original collateral and trade proceeds.
+
+use anchor_lang::prelude::*;
+use confidential_token as ct;
+use zama_fhe::{
+    Bool, Encrypted, ExecutionCpiAccounts, FheExecution, FheExecutionBuilder, FheHandle,
+    ReturningFheExecution, Scalar, Store, StoreId, Uint,
+};
+use zama_host::{EncryptedStore, program::ZamaHost};
 
 use crate::{
     ConfidentialRfqError, CurrentAccountVersion,
-    instructions::place_bid::BidReceipt,
-    state::rfq::{RFQ, RFQPrivateField},
+    state::{
+        market::Market,
+        rfq::{MakerPrivateField, RFQ, RFQPrivateField, RFQState, invalid_fhe},
+    },
     util::{
         cpi,
-        pda::{bid_receipt_seeds, rfq_state_signer_seeds},
-        rfq::validate_rfq_store,
+        pda::{maker_store_address, maker_store_signer_seeds, rfq_state_signer_seeds},
+        rfq::{validate_maker_store, validate_rfq_store},
         token_side::{
             __client_accounts_token_side, __cpi_client_accounts_token_side, TokenSide,
             TokenSideBumps,
         },
     },
 };
-use anchor_lang::prelude::*;
-use confidential_token as ct;
-use std::num::NonZeroU64;
-use zama_fhe::{
-    Bool, Encrypted, ExecutionCpiAccounts, FheExecution, FheExecutionBuilder, FheHandle, Scalar,
-    Store, StoreId, Uint,
-};
-use zama_host::program::ZamaHost;
 
 #[derive(Accounts)]
-#[instruction(maker_id: u64, bid_index: u64)]
 pub struct ClaimRfqMaker<'info> {
-    /// Only the bidder may claim, including after market removal.
     #[account(mut)]
-    pub maker: Signer<'info>,
+    pub caller: Signer<'info>,
+    /// CHECK: matched to the market's permanent maker identity, including disabled makers.
+    pub maker: UncheckedAccount<'info>,
+    pub market: Box<Account<'info, Market>>,
     pub rfq: AccountLoader<'info, RFQ>,
-    #[account(
-        mut,
-        close = maker,
-        seeds = [
-            bid_receipt_seeds(&rfq, &bid_index.to_le_bytes())[0],
-            bid_receipt_seeds(&rfq, &bid_index.to_le_bytes())[1],
-            bid_receipt_seeds(&rfq, &bid_index.to_le_bytes())[2],
-        ],
-        bump = bid_receipt.bump,
-    )]
-    pub bid_receipt: Box<Account<'info, BidReceipt>>,
     #[account(mut)]
-    pub rfq_store: Box<Account<'info, zama_host::EncryptedStore>>,
-
+    pub rfq_store: Box<Account<'info, EncryptedStore>>,
+    /// CHECK: validated against the RFQ-specific maker authority PDA.
+    pub maker_store_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub maker_store: Box<Account<'info, EncryptedStore>>,
     pub asset: TokenSide<'info>,
     pub basis: TokenSide<'info>,
-
-    /// CHECK: verified by the token event CPI.
-    pub confidential_token_event_authority: UncheckedAccount<'info>,
-    pub confidential_token_program: Program<'info, ct::program::ConfidentialToken>,
-    /// CHECK: verified by the host event CPI.
+    /// CHECK: validated by the host CPI.
+    pub host_config: UncheckedAccount<'info>,
+    /// CHECK: validated by the host CPI.
     pub zama_event_authority: UncheckedAccount<'info>,
-    /// CHECK: shared journal verified by the host and token program.
+    /// CHECK: validated by the host CPI.
     #[account(mut)]
     pub transient_store: UncheckedAccount<'info>,
-    /// CHECK: instructions sysvar verified by the host and token program.
+    /// CHECK: validated by the host CPI.
     pub instructions: UncheckedAccount<'info>,
-    pub host_config: Box<Account<'info, zama_host::HostConfig>>,
     pub zama_program: Program<'info, ZamaHost>,
+    /// CHECK: validated by the confidential-token CPI.
+    pub confidential_token_event_authority: UncheckedAccount<'info>,
+    pub confidential_token_program: Program<'info, ct::program::ConfidentialToken>,
     pub system_program: Program<'info, System>,
-    /// CHECK: optional RFQ meter, validated by the host.
-    #[account(mut)]
-    pub hcu_block_meter: Option<UncheckedAccount<'info>>,
-    /// CHECK: optional RFQ trust record, validated by the host.
-    pub hcu_trusted_app_record: Option<UncheckedAccount<'info>>,
 }
 
 pub fn claim_rfq_maker<'info>(
     ctx: Context<'info, ClaimRfqMaker<'info>>,
-    maker_id: u64,
-    bid_index: u64,
+    maker_id: u32,
 ) -> Result<()> {
-    let id = NonZeroU64::new(maker_id).ok_or(error!(ConfidentialRfqError::InvalidMakerId))?;
     let rfq_key = ctx.accounts.rfq.key();
-    let maker = ctx.accounts.maker.key();
-    let rfq_state = *ctx.accounts.rfq.load()?;
-    let RFQ {
-        version,
-        bid_count,
-        timeout,
-        asset_mint,
-        basis_mint,
-        ..
-    } = rfq_state;
+    let rfq = *ctx.accounts.rfq.load()?;
     require_eq!(
-        version,
-        RFQ::VERSION,
+        ctx.accounts.market.version,
+        Market::VERSION,
         ConfidentialRfqError::InvalidRfqAccounts
     );
-    require!(
-        bid_index < bid_count,
-        ConfidentialRfqError::InvalidRfqAccounts
+    require!(maker_id != 0, ConfidentialRfqError::InvalidMakerId);
+    require_keys_eq!(
+        ctx.accounts.market.key(),
+        rfq.market,
+        ConfidentialRfqError::MarketMismatch
     );
     require!(
-        ctx.accounts.bid_receipt.rfq == rfq_key
-            && ctx.accounts.bid_receipt.maker_id == maker_id
-            && ctx.accounts.bid_receipt.maker == maker,
+        ctx.accounts.market.maker(maker_id) == Some(ctx.accounts.maker.key()),
         ConfidentialRfqError::UnauthorizedMaker
     );
     validate_rfq_store(
         rfq_key,
-        &rfq_state,
+        &rfq,
         ctx.accounts.rfq_store.key(),
         &ctx.accounts.rfq_store,
     )?;
+    validate_maker_store(
+        rfq_key,
+        &rfq,
+        maker_id,
+        ctx.accounts.maker_store.key(),
+        &ctx.accounts.maker_store,
+    )?;
+    let (maker_authority, maker_bump) = maker_store_address(rfq_key, maker_id);
+    require_keys_eq!(
+        ctx.accounts.maker_store_authority.key(),
+        maker_authority,
+        ConfidentialRfqError::InvalidRfqAccounts
+    );
     for (side, mint) in [
-        (&ctx.accounts.asset, asset_mint),
-        (&ctx.accounts.basis, basis_mint),
+        (&ctx.accounts.asset, rfq.asset_mint),
+        (&ctx.accounts.basis, rfq.basis_mint),
     ] {
         require_keys_eq!(
             side.confidential_mint.key(),
             mint,
             ConfidentialRfqError::MintMismatch
         );
-        require_keys_eq!(
-            side.confidential_mint.underlying_mint,
-            side.underlying_mint.key(),
-            ConfidentialRfqError::MintMismatch
-        );
-        for (owner, token, store) in [
-            (rfq_key, &side.rfq_token_account, &side.rfq_balance_store),
-            (
-                maker,
-                &side.participant_token_account,
-                &side.participant_balance_store,
-            ),
-        ] {
-            let expected_token = ct::token_account_address(mint, owner).0;
-            require_keys_eq!(
-                token.key(),
-                expected_token,
-                ConfidentialRfqError::TokenAccountMismatch
-            );
-            require_keys_eq!(
-                store.key(),
-                ct::encrypted_store_address(mint, expected_token).0,
-                ConfidentialRfqError::TokenAccountMismatch
-            );
-        }
+        side.validate(ctx.accounts.maker.key(), rfq_key)?;
     }
+    let rfq_seeds = rfq_state_signer_seeds(&rfq, &rfq.nonce);
+    let id_bytes = maker_id.to_le_bytes();
+    let maker_seeds = maker_store_signer_seeds(&rfq_key, &id_bytes, &maker_bump);
+    let signers: &[&[&[u8]]] = &[&rfq_seeds, &maker_seeds];
 
-    require!(
-        Clock::get()?.unix_timestamp >= timeout,
-        ConfidentialRfqError::RfqNotExpired
-    );
-    let nonce = ctx.accounts.rfq_store.scope;
-    let authority_seeds = &rfq_state_signer_seeds(&rfq_state, &nonce);
-    let asset_balance_store_id = StoreId::new(
-        ct::ID,
-        ctx.accounts.asset.rfq_token_account.key(),
-        asset_mint.to_bytes(),
-    );
-    let basis_balance_store_id = StoreId::new(
-        ct::ID,
-        ctx.accounts.basis.rfq_token_account.key(),
-        basis_mint.to_bytes(),
-    );
-
-    // The first execution returns only the asset payout handle. Its grant is
-    // consumed by the next token CPI and leaves no persistent RFQ state.
-    let asset_handle = cpi::invoke_returning(
-        build_asset_payout_execution(
+    // Both sides observe the original position. The second batch consumes it, so
+    // repeated calls cannot pay again or decrement the active count twice.
+    for asset in [true, false] {
+        let side = if asset {
+            &ctx.accounts.asset
+        } else {
+            &ctx.accounts.basis
+        };
+        let target = ct::balance_slot(side.confidential_mint.key(), side.rfq_token_account.key()).0;
+        let execution = maker_payout_execution(
             &ctx.accounts.rfq_store,
-            asset_balance_store_id,
-            id,
+            &ctx.accounts.maker_store,
+            target,
             maker_id,
-        )?,
-        execution_accounts(&ctx),
-        [
-            ctx.accounts.rfq_store.to_account_info(),
-            ctx.accounts.asset.rfq_balance_store.to_account_info(),
-        ],
-        [ctx.accounts.rfq.to_account_info()],
-        &[authority_seeds],
-    )?;
-    cpi::transfer_maker_payout(&ctx, authority_seeds, asset_handle, cpi::PayoutToken::Asset)?;
-
-    // The second execution sees the original bid values, computes the basis
-    // payout, zeroes a claimed bid, increments the encrypted close count once,
-    // and seals a new public CanClose handle.
-    let basis_handle = cpi::invoke_returning(
-        build_basis_payout_execution(
-            &ctx.accounts.rfq_store,
-            basis_balance_store_id,
-            id,
-            maker_id,
-            bid_count,
-            maker,
-        )?,
-        execution_accounts(&ctx),
-        [
-            ctx.accounts.rfq_store.to_account_info(),
-            ctx.accounts.basis.rfq_balance_store.to_account_info(),
-        ],
-        [ctx.accounts.rfq.to_account_info()],
-        &[authority_seeds],
-    )?;
-    cpi::transfer_maker_payout(&ctx, authority_seeds, basis_handle, cpi::PayoutToken::Basis)?;
+            ctx.accounts.maker.key(),
+            asset,
+        )?;
+        let handle = cpi::invoke_returning(
+            execution,
+            ExecutionCpiAccounts {
+                payer: ctx.accounts.caller.to_account_info(),
+                authority: ctx.accounts.rfq.to_account_info(),
+                host_config: ctx.accounts.host_config.to_account_info(),
+                deny_scope_records: ctx.remaining_accounts.to_vec(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                hcu_block_meter: None,
+                hcu_trusted_app_record: None,
+                rand_nonce: None,
+                event_authority: ctx.accounts.zama_event_authority.to_account_info(),
+                transient_store: ctx.accounts.transient_store.to_account_info(),
+                instructions: ctx.accounts.instructions.to_account_info(),
+                program: ctx.accounts.zama_program.to_account_info(),
+            },
+            [
+                ctx.accounts.rfq_store.to_account_info(),
+                ctx.accounts.maker_store.to_account_info(),
+                side.rfq_balance_store.to_account_info(),
+            ],
+            [
+                ctx.accounts.rfq.to_account_info(),
+                ctx.accounts.maker_store_authority.to_account_info(),
+            ],
+            signers,
+        )?;
+        cpi::transfer_from_grant(
+            ctx.accounts.confidential_token_program.key(),
+            ct::cpi::accounts::ConfidentialTransferFromValue {
+                owner: ctx.accounts.rfq.to_account_info(),
+                payer: ctx.accounts.caller.to_account_info(),
+                mint: side.confidential_mint.to_account_info(),
+                underlying_mint: side.underlying_mint.to_account_info(),
+                from_ata: side.rfq_ata.to_account_info(),
+                to_ata: side.participant_ata.to_account_info(),
+                from_account: side.rfq_token_account.to_account_info(),
+                to_account: side.participant_token_account.to_account_info(),
+                from_store: side.rfq_balance_store.to_account_info(),
+                to_store: side.participant_balance_store.to_account_info(),
+                amount_store: None,
+                amount_authority: None,
+                zama_event_authority: ctx.accounts.zama_event_authority.to_account_info(),
+                transient_store: ctx.accounts.transient_store.to_account_info(),
+                instructions: ctx.accounts.instructions.to_account_info(),
+                zama_program: ctx.accounts.zama_program.to_account_info(),
+                host_config: ctx.accounts.host_config.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                hcu_block_meter: None,
+                hcu_trusted_app_record: None,
+                event_authority: ctx
+                    .accounts
+                    .confidential_token_event_authority
+                    .to_account_info(),
+                program: ctx.accounts.confidential_token_program.to_account_info(),
+            },
+            signers,
+            handle,
+        )?;
+    }
     Ok(())
 }
 
+/// Refund the unused quote side and replace the winning side's collateral with its
+/// proceeds. A sell-only position is live; zeroing both quotes is the act-once guard.
 #[inline(never)]
-fn build_asset_payout_execution(
-    rfq_account: &zama_host::EncryptedStore,
-    token_store_id: StoreId,
-    id: NonZeroU64,
-    maker_id: u64,
-) -> Result<zama_fhe::ReturningFheExecution<Uint<64>>> {
-    let state = Box::new(Store::new(rfq_account));
-    let inputs = Box::new(AssetPayoutInputs {
-        buy: state
-            .get::<Uint<64>>(RFQPrivateField::MakerBuy(id).key())
+fn maker_payout_execution(
+    account: &EncryptedStore,
+    maker_account: &EncryptedStore,
+    target: StoreId,
+    maker_id: u32,
+    maker_key: Pubkey,
+    asset: bool,
+) -> Result<ReturningFheExecution<Uint<64>>> {
+    let store = Box::new(Store::new(account));
+    let maker = Box::new(Store::new(maker_account));
+    let input = Box::new(MakerPayoutInputs {
+        state: store
+            .get::<Uint<8>>(RFQPrivateField::State.key())
             .map_err(invalid_fhe)?,
-        user_buyer: state
+        buyer: store
             .get::<Bool>(RFQPrivateField::UserBuyer.key())
             .map_err(invalid_fhe)?,
-        best_maker: state
-            .get::<Uint<64>>(RFQPrivateField::BestMaker.key())
-            .map_err(invalid_fhe)?,
-        size: state
+        size: store
             .get::<Uint<64>>(RFQPrivateField::Size.key())
             .map_err(invalid_fhe)?,
-    });
-    let output = Box::new(state.result().allow_transient(token_store_id));
-    FheExecution::build_returning(state.id(), move |fhe| {
-        let payout = asset_payout_value(fhe, &inputs, maker_id)?;
-        fhe.output(payout, *output)?;
-        Ok(payout)
-    })
-    .map_err(invalid_fhe)
-}
-
-struct AssetPayoutInputs {
-    buy: FheHandle<Uint<64>>,
-    user_buyer: FheHandle<Bool>,
-    best_maker: FheHandle<Uint<64>>,
-    size: FheHandle<Uint<64>>,
-}
-
-#[inline(never)]
-fn asset_payout_value<'id>(
-    fhe: &mut FheExecutionBuilder<'id>,
-    input: &AssetPayoutInputs,
-    maker_id: u64,
-) -> zama_fhe::Result<Encrypted<'id, Uint<64>>> {
-    let live_bid = fhe.gt(input.buy, Scalar::<Uint<64>>::u64(0))?;
-    let winner = fhe.eq(input.best_maker, Scalar::<Uint<64>>::u64(maker_id))?;
-    let zero = fhe.trivial_encrypt_u64(0)?;
-    let two_sizes = fhe.add(input.size, input.size)?;
-    let winner_amount = fhe.if_then_else(input.user_buyer, zero, two_sizes)?;
-    let selected = fhe.if_then_else(winner, winner_amount, input.size)?;
-    fhe.if_then_else(live_bid, selected, zero)
-}
-
-#[inline(never)]
-fn build_basis_payout_execution(
-    rfq_account: &zama_host::EncryptedStore,
-    token_store_id: StoreId,
-    id: NonZeroU64,
-    maker_id: u64,
-    bid_count: u64,
-    maker: Pubkey,
-) -> Result<zama_fhe::ReturningFheExecution<Uint<64>>> {
-    let state = Box::new(Store::new(rfq_account));
-    let inputs = Box::new(BasisPayoutInputs {
-        buy: state
-            .get::<Uint<64>>(RFQPrivateField::MakerBuy(id).key())
-            .map_err(invalid_fhe)?,
-        sell: state
-            .get::<Uint<64>>(RFQPrivateField::MakerSell(id).key())
-            .map_err(invalid_fhe)?,
-        user_buyer: state
-            .get::<Bool>(RFQPrivateField::UserBuyer.key())
-            .map_err(invalid_fhe)?,
-        best_maker: state
-            .get::<Uint<64>>(RFQPrivateField::BestMaker.key())
-            .map_err(invalid_fhe)?,
-        best_offer: state
+        best: store
             .get::<Uint<64>>(RFQPrivateField::BestOffer.key())
             .map_err(invalid_fhe)?,
-        closed_bids: state
-            .get::<Uint<64>>(RFQPrivateField::ClosedBids.key())
+        best_maker: store
+            .get::<Uint<32>>(RFQPrivateField::BestMaker.key())
             .map_err(invalid_fhe)?,
-        user_claimed: state
-            .get::<Bool>(RFQPrivateField::UserClaimed.key())
+        count: store
+            .get::<Uint<32>>(RFQPrivateField::BidCount.key())
+            .map_err(invalid_fhe)?,
+        buy: maker
+            .get::<Uint<64>>(MakerPrivateField::Buy.key())
+            .map_err(invalid_fhe)?,
+        sell: maker
+            .get::<Uint<64>>(MakerPrivateField::Sell.key())
+            .map_err(invalid_fhe)?,
+        sequence: maker
+            .get::<Uint<32>>(MakerPrivateField::Sequence.key())
             .map_err(invalid_fhe)?,
     });
-    let buy_output = Box::new(state.set(RFQPrivateField::MakerBuy(id).key()).allow(maker));
-    let sell_output = Box::new(state.set(RFQPrivateField::MakerSell(id).key()).allow(maker));
-    let closed_output = Box::new(state.set(RFQPrivateField::ClosedBids.key()));
-    let can_close_output = Box::new(state.set(RFQPrivateField::CanClose.key()).make_public());
-    let payout_output = Box::new(state.result().allow_transient(token_store_id));
-    FheExecution::build_returning(state.id(), move |fhe| {
-        let value = basis_payout_value(fhe, &inputs, maker_id, bid_count)?;
-        fhe.output(value.next_buy, *buy_output)?;
-        fhe.output(value.next_sell, *sell_output)?;
-        fhe.output(value.next_closed_bids, *closed_output)?;
-        fhe.output(value.can_close, *can_close_output)?;
-        fhe.output(value.payout, *payout_output)?;
-        Ok(value.payout)
-    })
+    FheExecution::build_returning(
+        store.id(),
+        #[inline(never)]
+        move |fhe| {
+            // Compute proceeds/refunds from the original bid, then consume it once.
+            let conditions = maker_claim_conditions(fhe, &input, maker_id)?;
+            let values = maker_payout_amount(fhe, &input, &conditions, asset)?;
+            fhe.output(values.payout, store.result().allow_transient(target))?;
+            if !asset {
+                finalize_maker_claim(fhe, &store, &maker, &input, &values, maker_key)?;
+            }
+            Ok(values.payout)
+        },
+    )
     .map_err(invalid_fhe)
 }
 
-struct BasisPayoutInputs {
+/// Evaluate the private state and live-position predicates before payout arithmetic.
+#[inline(never)]
+fn maker_claim_conditions<'id>(
+    fhe: &mut FheExecutionBuilder<'id>,
+    input: &MakerPayoutInputs,
+    maker_id: u32,
+) -> zama_fhe::Result<Box<MakerClaimConditions<'id>>> {
+    let claimed = fhe.eq(input.state, Scalar::<Uint<8>>::u8(RFQState::Claimed as u8))?;
+    let claimable = fhe.eq(
+        input.state,
+        Scalar::<Uint<8>>::u8(RFQState::Claimable as u8),
+    )?;
+    let canceled = fhe.eq(input.state, Scalar::<Uint<8>>::u8(RFQState::Canceled as u8))?;
+    let invalid = fhe.eq(input.state, Scalar::<Uint<8>>::u8(RFQState::Invalid as u8))?;
+    let terminal = fhe.or(claimed, canceled)?;
+    let terminal = fhe.or(terminal, invalid)?;
+    let settled = fhe.or(terminal, claimable)?;
+    let has_buy = fhe.ne(input.buy, Scalar::<Uint<64>>::u64(0))?;
+    let has_sell = fhe.ne(input.sell, Scalar::<Uint<64>>::u64(0))?;
+    let live = fhe.or(has_buy, has_sell)?;
+    let claim = fhe.and(settled, live)?;
+    let winner = fhe.eq(input.best_maker, Scalar::<Uint<32>>::u32(maker_id))?;
+    let zero = fhe.trivial_encrypt_u64(0)?;
+
+    Ok(Box::new(MakerClaimConditions {
+        claim,
+        terminal,
+        winner,
+        has_sell,
+        zero,
+    }))
+}
+
+/// Calculate trade proceeds and unused collateral under the private claim predicates.
+#[inline(never)]
+fn maker_payout_amount<'id>(
+    fhe: &mut FheExecutionBuilder<'id>,
+    input: &MakerPayoutInputs,
+    conditions: &MakerClaimConditions<'id>,
+    asset: bool,
+) -> zama_fhe::Result<Box<MakerPayoutValues<'id>>> {
+    let due = if asset {
+        let collateral = fhe.if_then_else(conditions.has_sell, input.size, conditions.zero)?;
+        let bought_and_refunded = fhe.add(input.size, collateral)?;
+        let winning = fhe.if_then_else(input.buyer, conditions.zero, bought_and_refunded)?;
+        fhe.if_then_else(conditions.winner, winning, collateral)?
+    } else {
+        let sold_and_refunded = fhe.add(input.best, input.buy)?;
+        let purchase_change = fhe.sub(input.buy, input.best)?;
+        let winning = fhe.if_then_else(input.buyer, sold_and_refunded, purchase_change)?;
+        fhe.if_then_else(conditions.winner, winning, input.buy)?
+    };
+    let payout = fhe.if_then_else(conditions.claim, due, conditions.zero)?;
+    Ok(Box::new(MakerPayoutValues {
+        payout,
+        claim: conditions.claim,
+        terminal: conditions.terminal,
+        zero: conditions.zero,
+    }))
+}
+
+/// Clear both quote sides and decrement the count only for a live, eligible claim.
+/// The same FHE batch seals the updated closure predicate after the final payout.
+#[inline(never)]
+fn finalize_maker_claim<'id>(
+    fhe: &mut FheExecutionBuilder<'id>,
+    store: &Store,
+    maker: &Store,
+    input: &MakerPayoutInputs,
+    values: &MakerPayoutValues<'id>,
+    maker_key: Pubkey,
+) -> zama_fhe::Result<()> {
+    let next_buy = fhe.if_then_else(values.claim, values.zero, input.buy)?;
+    let next_sell = fhe.if_then_else(values.claim, values.zero, input.sell)?;
+    let zero_count = fhe.trivial_encrypt(Scalar::<Uint<32>>::u32(0))?;
+    let one = fhe.trivial_encrypt(Scalar::<Uint<32>>::u32(1))?;
+    let decrement = fhe.if_then_else(values.claim, one, zero_count)?;
+    let next_count = fhe.sub(input.count, decrement)?;
+    let next_sequence = fhe.if_then_else(values.claim, zero_count, input.sequence)?;
+    let empty = fhe.eq(next_count, Scalar::<Uint<32>>::u32(0))?;
+    let can_close = fhe.and(values.terminal, empty)?;
+    fhe.output(
+        next_buy,
+        maker.set(MakerPrivateField::Buy.key()).allow(maker_key),
+    )?;
+    fhe.output(
+        next_sell,
+        maker.set(MakerPrivateField::Sell.key()).allow(maker_key),
+    )?;
+    fhe.output(
+        next_sequence,
+        maker.set(MakerPrivateField::Sequence.key()).make_public(),
+    )?;
+    fhe.output(
+        next_count,
+        store.set(RFQPrivateField::BidCount.key()).make_public(),
+    )?;
+    fhe.output(
+        can_close,
+        store.set(RFQPrivateField::CanClose.key()).make_public(),
+    )?;
+    Ok(())
+}
+
+struct MakerClaimConditions<'id> {
+    claim: Encrypted<'id, Bool>,
+    terminal: Encrypted<'id, Bool>,
+    winner: Encrypted<'id, Bool>,
+    has_sell: Encrypted<'id, Bool>,
+    zero: Encrypted<'id, Uint<64>>,
+}
+
+struct MakerPayoutValues<'id> {
+    payout: Encrypted<'id, Uint<64>>,
+    claim: Encrypted<'id, Bool>,
+    terminal: Encrypted<'id, Bool>,
+    zero: Encrypted<'id, Uint<64>>,
+}
+
+struct MakerPayoutInputs {
+    state: FheHandle<Uint<8>>,
+    buyer: FheHandle<Bool>,
+    size: FheHandle<Uint<64>>,
+    best: FheHandle<Uint<64>>,
+    best_maker: FheHandle<Uint<32>>,
+    count: FheHandle<Uint<32>>,
     buy: FheHandle<Uint<64>>,
     sell: FheHandle<Uint<64>>,
-    user_buyer: FheHandle<Bool>,
-    best_maker: FheHandle<Uint<64>>,
-    best_offer: FheHandle<Uint<64>>,
-    closed_bids: FheHandle<Uint<64>>,
-    user_claimed: FheHandle<Bool>,
-}
-
-struct BasisPayoutValue<'id> {
-    payout: Encrypted<'id, Uint<64>>,
-    next_buy: Encrypted<'id, Uint<64>>,
-    next_sell: Encrypted<'id, Uint<64>>,
-    next_closed_bids: Encrypted<'id, Uint<64>>,
-    can_close: Encrypted<'id, Bool>,
-}
-
-#[inline(never)]
-fn basis_payout_value<'id>(
-    fhe: &mut FheExecutionBuilder<'id>,
-    input: &BasisPayoutInputs,
-    maker_id: u64,
-    bid_count: u64,
-) -> zama_fhe::Result<BasisPayoutValue<'id>> {
-    let live_bid = fhe.gt(input.buy, Scalar::<Uint<64>>::u64(0))?;
-    let winner = fhe.eq(input.best_maker, Scalar::<Uint<64>>::u64(maker_id))?;
-    let zero = fhe.trivial_encrypt_u64(0)?;
-    let one = fhe.trivial_encrypt_u64(1)?;
-    let buyer_payout = fhe.add(input.buy, input.best_offer)?;
-    let seller_payout = fhe.sub(input.buy, input.best_offer)?;
-    let winning_amount = fhe.if_then_else(input.user_buyer, buyer_payout, seller_payout)?;
-    let selected = fhe.if_then_else(winner, winning_amount, input.buy)?;
-    let payout = fhe.if_then_else(live_bid, selected, zero)?;
-    let next_buy = fhe.if_then_else(live_bid, zero, input.buy)?;
-    let next_sell = fhe.if_then_else(live_bid, zero, input.sell)?;
-    let increment = fhe.if_then_else(live_bid, one, zero)?;
-    let next_closed_bids = fhe.add(input.closed_bids, increment)?;
-    let all_bids_closed = fhe.eq(next_closed_bids, Scalar::<Uint<64>>::u64(bid_count))?;
-    let can_close = fhe.and(input.user_claimed, all_bids_closed)?;
-    Ok(BasisPayoutValue {
-        payout,
-        next_buy,
-        next_sell,
-        next_closed_bids,
-        can_close,
-    })
-}
-
-fn execution_accounts<'info>(
-    ctx: &Context<'info, ClaimRfqMaker<'info>>,
-) -> ExecutionCpiAccounts<'info> {
-    ExecutionCpiAccounts {
-        payer: ctx.accounts.maker.to_account_info(),
-        authority: ctx.accounts.rfq.to_account_info(),
-        host_config: ctx.accounts.host_config.to_account_info(),
-        deny_scope_records: ctx.remaining_accounts.to_vec(),
-        system_program: ctx.accounts.system_program.to_account_info(),
-        hcu_block_meter: ctx
-            .accounts
-            .hcu_block_meter
-            .as_ref()
-            .map(ToAccountInfo::to_account_info),
-        hcu_trusted_app_record: ctx
-            .accounts
-            .hcu_trusted_app_record
-            .as_ref()
-            .map(ToAccountInfo::to_account_info),
-        rand_nonce: None,
-        event_authority: ctx.accounts.zama_event_authority.to_account_info(),
-        transient_store: ctx.accounts.transient_store.to_account_info(),
-        instructions: ctx.accounts.instructions.to_account_info(),
-        program: ctx.accounts.zama_program.to_account_info(),
-    }
-}
-
-fn invalid_fhe(error: zama_fhe::FheExecutionBuildError) -> anchor_lang::error::Error {
-    msg!("invalid maker claim FHE execution: {:?}", error);
-    error!(ConfidentialRfqError::InvalidFheExecution)
-}
-
-#[cfg(test)]
-mod packet_tests {
-    use super::*;
-    use anchor_lang::{InstructionData, ToAccountMetas};
-    use solana_sdk::{
-        hash::Hash,
-        instruction::Instruction,
-        message::{AddressLookupTableAccount, v0},
-    };
-    use std::str::FromStr;
-
-    #[test]
-    fn maker_claim_fits_v0_transaction_packet() {
-        let maker = Pubkey::new_unique();
-        let next = || Pubkey::new_unique();
-        let accounts = crate::accounts::ClaimRfqMaker {
-            maker,
-            rfq: next(),
-            bid_receipt: next(),
-            rfq_store: next(),
-            asset: crate::accounts::TokenSide {
-                confidential_mint: next(),
-                underlying_mint: next(),
-                participant_ata: next(),
-                rfq_ata: next(),
-                participant_token_account: next(),
-                rfq_token_account: next(),
-                participant_balance_store: next(),
-                rfq_balance_store: next(),
-            },
-            basis: crate::accounts::TokenSide {
-                confidential_mint: next(),
-                underlying_mint: next(),
-                participant_ata: next(),
-                rfq_ata: next(),
-                participant_token_account: next(),
-                rfq_token_account: next(),
-                participant_balance_store: next(),
-                rfq_balance_store: next(),
-            },
-            confidential_token_event_authority: next(),
-            confidential_token_program: ct::ID,
-            zama_event_authority: next(),
-            transient_store: zama_host::transient_store_address(maker).0,
-            instructions: Pubkey::from_str("Sysvar1nstructions1111111111111111111111111").unwrap(),
-            host_config: next(),
-            zama_program: zama_host::ID,
-            system_program: System::id(),
-            hcu_block_meter: None,
-            hcu_trusted_app_record: None,
-        };
-        let instruction = Instruction {
-            program_id: crate::ID,
-            accounts: accounts.to_account_metas(None),
-            data: crate::instruction::ClaimRfqMaker {
-                maker_id: 1,
-                bid_index: 0,
-            }
-            .data(),
-        };
-        let envelope = zama_solana_test_kit::transaction::fhe_transaction(maker, [instruction]);
-        let mut lookup_addresses: Vec<Pubkey> = envelope
-            .iter()
-            .flat_map(|ix| ix.accounts.iter())
-            .filter(|meta| !meta.is_signer)
-            .map(|meta| meta.pubkey)
-            .collect();
-        lookup_addresses.sort_unstable();
-        lookup_addresses.dedup();
-        let table = AddressLookupTableAccount {
-            key: next(),
-            addresses: lookup_addresses,
-        };
-        let message = v0::Message::try_compile(&maker, &envelope, &[table], Hash::default())
-            .expect("v0 maker claim message should compile");
-        let wire_size = 1
-            + 64 * usize::from(message.header.num_required_signatures)
-            + message.serialize().len();
-        eprintln!("maker claim wire size: {wire_size} bytes");
-        assert!(wire_size <= 1_232);
-    }
+    sequence: FheHandle<Uint<32>>,
 }

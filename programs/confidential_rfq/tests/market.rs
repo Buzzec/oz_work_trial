@@ -35,7 +35,7 @@ fn assert_market_size(
     let account = account(accounts, key);
     let market = Market::try_deserialize(&mut account.data.as_slice()).unwrap();
     assert_eq!(market.maker_count(), maker_count);
-    assert_eq!(account.data.len(), 46 + 40 * maker_count);
+    assert_eq!(account.data.len(), Market::space(maker_count));
     assert_eq!(
         account.lamports,
         svm.sysvars.rent.minimum_balance(account.data.len())
@@ -43,7 +43,7 @@ fn assert_market_size(
 }
 
 #[test]
-fn market_reallocates_and_refunds_rent_as_makers_change() {
+fn market_retains_disabled_identities_and_reactivates_their_delegation() {
     let deploy = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/deploy/");
     let mut svm = Mollusk::new(&confidential_rfq::ID, &format!("{deploy}confidential_rfq"));
     svm.add_program(&zama_host::ID, &format!("{deploy}zama_host"));
@@ -127,7 +127,32 @@ fn market_reallocates_and_refunds_rent_as_makers_change() {
 
     // The host requires revocation to occur after the grant's slot.
     svm.warp_to_slot(101);
-    for (index, (maker_id, maker)) in makers.iter().copied().enumerate().rev() {
+    // Revoking one ID must not let an admin accidentally select another
+    // maker's delegation record while disabling the requested entry.
+    let wrong_delegation =
+        zama_host::user_decryption_delegation_address(maker_group, makers[1].1, wildcard).0;
+    svm.process_and_validate_instruction(
+        &anchor_ix(
+            confidential_rfq::ID,
+            accounts::RemoveMaker {
+                admin,
+                market,
+                maker_group,
+                host_config,
+                delegation_record: wrong_delegation,
+                zama_program: zama_host::ID,
+                system_program: System::id(),
+            },
+            instruction::RemoveMaker {
+                maker_id: makers[0].0,
+            },
+        ),
+        &accounts,
+        &[Check::err(solana_sdk::program_error::ProgramError::Custom(
+            u32::from(confidential_rfq::ConfidentialRfqError::InvalidRfqAccounts),
+        ))],
+    );
+    for (maker_id, maker) in makers.iter().copied().rev() {
         let delegation_record =
             zama_host::user_decryption_delegation_address(maker_group, maker, wildcard).0;
         let admin_before = account(&accounts, admin).lamports;
@@ -149,18 +174,49 @@ fn market_reallocates_and_refunds_rent_as_makers_change() {
             ),
             &mut accounts,
         );
-        assert_market_size(&svm, &accounts, market, index);
+        assert_market_size(&svm, &accounts, market, makers.len());
         let state =
             Market::try_deserialize(&mut account(&accounts, market).data.as_slice()).unwrap();
-        assert_eq!(state.maker(maker_id), None);
-        assert_eq!(
-            account(&accounts, admin).lamports - admin_before,
-            rent_before - account(&accounts, market).lamports
-        );
+        assert_eq!(state.maker(maker_id), Some(maker));
+        assert_eq!(state.active_maker(maker_id), None);
+        assert_eq!(account(&accounts, admin).lamports, admin_before);
+        assert_eq!(account(&accounts, market).lamports, rent_before);
         let delegation = zama_host::UserDecryptionDelegation::try_deserialize(
             &mut account(&accounts, delegation_record).data.as_slice(),
         )
         .unwrap();
         assert!(delegation.revoked);
     }
+
+    svm.warp_to_slot(102);
+    let (maker_id, maker) = makers[0];
+    let delegation_record =
+        zama_host::user_decryption_delegation_address(maker_group, maker, wildcard).0;
+    let admin_before = account(&accounts, admin).lamports;
+    execute(
+        &svm,
+        anchor_ix(
+            confidential_rfq::ID,
+            accounts::AddMaker {
+                admin,
+                market,
+                maker_group,
+                host_config,
+                delegation_record,
+                zama_program: zama_host::ID,
+                system_program: System::id(),
+            },
+            instruction::AddMaker { maker_id, maker },
+        ),
+        &mut accounts,
+    );
+    assert_market_size(&svm, &accounts, market, makers.len());
+    assert_eq!(account(&accounts, admin).lamports, admin_before);
+    let state = Market::try_deserialize(&mut account(&accounts, market).data.as_slice()).unwrap();
+    assert_eq!(state.active_maker(maker_id), Some(maker));
+    let delegation = zama_host::UserDecryptionDelegation::try_deserialize(
+        &mut account(&accounts, delegation_record).data.as_slice(),
+    )
+    .unwrap();
+    assert!(!delegation.revoked);
 }

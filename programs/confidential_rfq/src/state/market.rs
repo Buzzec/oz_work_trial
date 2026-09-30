@@ -8,14 +8,15 @@ pub struct Market {
     pub version: u8,
     pub admin: Pubkey,
     pub maker_group_bump: u8,
-    /// Sorted by maker ID; mutations go through `add_maker` and `remove_maker`.
+    /// Sorted by maker ID. Disabled entries retain ownership of outstanding bids.
     makers: Vec<MakerEntry>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 struct MakerEntry {
-    maker_id: u64,
+    maker_id: u32,
     maker: Pubkey,
+    active: bool,
 }
 
 impl Market {
@@ -28,47 +29,101 @@ impl Market {
         }
     }
 
-    /// Account discriminator, fixed fields, vector length, and maker entries.
+    /// Account discriminator, fixed fields, vector length, and retained maker entries.
     pub const fn space(maker_count: usize) -> usize {
-        8 + 1 + 32 + 1 + 4 + maker_count * (8 + 32)
+        8 + 1 + 32 + 1 + 4 + maker_count * (4 + 32 + 1)
     }
 
     pub fn maker_count(&self) -> usize {
         self.makers.len()
     }
 
-    pub fn maker(&self, maker_id: u64) -> Option<Pubkey> {
+    /// Historical identity remains available after a maker is disabled.
+    pub fn maker(&self, maker_id: u32) -> Option<Pubkey> {
+        if self.version != Self::VERSION {
+            return None;
+        }
         self.maker_index(maker_id)
             .ok()
             .map(|index| self.makers[index].maker)
     }
 
-    pub fn add_maker(&mut self, maker_id: u64, maker: Pubkey) -> Result<()> {
+    /// Only active entries may submit or update bids.
+    pub fn active_maker(&self, maker_id: u32) -> Option<Pubkey> {
+        if self.version != Self::VERSION {
+            return None;
+        }
+        self.maker_index(maker_id)
+            .ok()
+            .map(|index| &self.makers[index])
+            .filter(|entry| entry.active)
+            .map(|entry| entry.maker)
+    }
+
+    pub fn add_maker(&mut self, maker_id: u32, maker: Pubkey) -> Result<()> {
+        require_eq!(
+            self.version,
+            Self::VERSION,
+            ConfidentialRfqError::InvalidRfqAccounts
+        );
         require!(maker_id != 0, ConfidentialRfqError::InvalidMakerId);
-        let index = self
-            .maker_index(maker_id)
-            .err()
-            .ok_or(error!(ConfidentialRfqError::MakerAlreadyExists))?;
-        self.makers.insert(index, MakerEntry { maker_id, maker });
+        require_keys_neq!(
+            maker,
+            Pubkey::default(),
+            ConfidentialRfqError::InvalidMakerKey
+        );
+        match self.maker_index(maker_id) {
+            Ok(index) => {
+                let entry = &mut self.makers[index];
+                require!(
+                    !entry.active && entry.maker == maker,
+                    ConfidentialRfqError::MakerAlreadyExists
+                );
+                entry.active = true;
+            }
+            Err(index) => {
+                require!(
+                    self.makers.iter().all(|entry| entry.maker != maker),
+                    ConfidentialRfqError::MakerKeyAlreadyExists
+                );
+                self.makers.insert(
+                    index,
+                    MakerEntry {
+                        maker_id,
+                        maker,
+                        active: true,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
-    pub fn remove_maker(&mut self, maker_id: u64) -> Result<()> {
+    pub fn remove_maker(&mut self, maker_id: u32) -> Result<()> {
+        require_eq!(
+            self.version,
+            Self::VERSION,
+            ConfidentialRfqError::InvalidRfqAccounts
+        );
         require!(maker_id != 0, ConfidentialRfqError::InvalidMakerId);
         let index = self
             .maker_index(maker_id)
             .map_err(|_| error!(ConfidentialRfqError::MakerNotFound))?;
-        self.makers.remove(index);
+        require!(
+            self.makers[index].active,
+            ConfidentialRfqError::MakerNotFound
+        );
+        self.makers[index].active = false;
         Ok(())
     }
 
-    fn maker_index(&self, maker_id: u64) -> std::result::Result<usize, usize> {
+    fn maker_index(&self, maker_id: u32) -> std::result::Result<usize, usize> {
         self.makers
             .binary_search_by_key(&maker_id, |entry| entry.maker_id)
     }
 }
 impl CurrentAccountVersion for Market {
-    const VERSION: u8 = 1;
+    const VERSION: u8 = 2;
 
     fn version(&self) -> u8 {
         self.version
@@ -88,8 +143,6 @@ impl<'info> MarketExt for Account<'info, Market> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::MakerId;
-    use std::collections::BTreeMap;
 
     fn market() -> Market {
         Market::new(Pubkey::new_unique(), 0)
@@ -102,9 +155,9 @@ mod tests {
     }
 
     #[test]
-    fn makers_stay_sorted_through_insertions_and_removals() {
+    fn disabled_makers_keep_their_identity_and_sorted_position() {
         let mut market = market();
-        let makers = [30, 10, u64::MAX, 20, 1].map(|id| (id, Pubkey::new_unique()));
+        let makers = [30, 10, u32::MAX, 20, 1].map(|id| (id, Pubkey::new_unique()));
         for (id, maker) in makers {
             market.add_maker(id, maker).unwrap();
         }
@@ -114,53 +167,57 @@ mod tests {
                 .iter()
                 .map(|entry| entry.maker_id)
                 .collect::<Vec<_>>(),
-            [1, 10, 20, 30, u64::MAX]
+            [1, 10, 20, 30, u32::MAX]
         );
         for (id, maker) in makers {
+            assert_eq!(market.active_maker(id), Some(maker));
+            market.remove_maker(id).unwrap();
+            assert_eq!(market.active_maker(id), None);
             assert_eq!(market.maker(id), Some(maker));
         }
-        for missing in [0, 2, 15, 31] {
-            assert_eq!(market.maker(missing), None);
-        }
-        for id in [20, 1, u64::MAX] {
-            market.remove_maker(id).unwrap();
-            assert_eq!(market.maker(id), None);
-        }
-        assert_eq!(market.maker_count(), 2);
-        assert_eq!(market.maker(10), Some(makers[1].1));
-        assert_eq!(market.maker(30), Some(makers[0].1));
+        assert_eq!(market.maker_count(), makers.len());
         market.add_maker(20, makers[3].1).unwrap();
-        assert_eq!(market.maker(20), Some(makers[3].1));
+        assert_eq!(market.active_maker(20), Some(makers[3].1));
     }
 
     #[test]
-    fn rejected_mutations_leave_existing_makers_unchanged() {
+    fn rejected_mutations_preserve_current_and_historical_membership() {
         let mut market = market();
         let alice = Pubkey::new_unique();
         market.add_maker(1, alice).unwrap();
         let before = serialized(&market);
+        assert!(market.add_maker(1, alice).is_err());
         assert!(market.add_maker(1, Pubkey::new_unique()).is_err());
         assert!(market.add_maker(0, Pubkey::new_unique()).is_err());
+        assert!(market.add_maker(2, Pubkey::default()).is_err());
+        assert!(market.add_maker(2, alice).is_err());
         assert!(market.remove_maker(0).is_err());
         assert!(market.remove_maker(2).is_err());
         assert_eq!(serialized(&market), before);
-        assert_eq!(market.maker(1), Some(alice));
-    }
-
-    #[test]
-    fn maker_keys_can_be_reused_under_distinct_ids() {
-        let mut market = market();
-        let maker = Pubkey::new_unique();
-        market.add_maker(2, maker).unwrap();
-        market.add_maker(1, maker).unwrap();
         market.remove_maker(1).unwrap();
-        assert_eq!(market.maker(2), Some(maker));
-        market.add_maker(1, maker).unwrap();
-        assert_eq!(market.maker(1), Some(maker));
+        let disabled = serialized(&market);
+        assert!(market.add_maker(1, Pubkey::new_unique()).is_err());
+        assert!(market.add_maker(2, alice).is_err());
+        assert!(market.remove_maker(1).is_err());
+        assert_eq!(serialized(&market), disabled);
     }
 
     #[test]
-    fn market_space_matches_serialized_size_as_membership_changes() {
+    fn unsupported_market_versions_cannot_authorize_or_change_membership() {
+        let mut market = market();
+        let alice = Pubkey::new_unique();
+        market.add_maker(1, alice).unwrap();
+        market.version = 1;
+        assert_eq!(market.maker(1), None);
+        assert_eq!(market.active_maker(1), None);
+        let before = serialized(&market);
+        assert!(market.add_maker(2, Pubkey::new_unique()).is_err());
+        assert!(market.remove_maker(1).is_err());
+        assert_eq!(serialized(&market), before);
+    }
+
+    #[test]
+    fn market_space_accounts_for_retained_disabled_entries() {
         let mut market = market();
         for maker_id in (1..=300).rev() {
             market.add_maker(maker_id, Pubkey::new_unique()).unwrap();
@@ -169,33 +226,10 @@ mod tests {
                 Market::space(market.maker_count())
             );
         }
+        let full_size = serialized(&market).len();
         for maker_id in 1..=300 {
             market.remove_maker(maker_id).unwrap();
-            assert_eq!(
-                serialized(&market).len(),
-                Market::space(market.maker_count())
-            );
-        }
-    }
-
-    #[test]
-    fn sorted_vector_preserves_the_previous_map_account_encoding() {
-        let mut market = market();
-        let mut previous_makers = BTreeMap::new();
-        for id in [30, 1, 20] {
-            let maker = Pubkey::new_unique();
-            market.add_maker(id, maker).unwrap();
-            previous_makers.insert(MakerId::new(id).unwrap(), maker);
-        }
-        let mut previous_data = Market::DISCRIMINATOR.to_vec();
-        AnchorSerialize::serialize(&market.version, &mut previous_data).unwrap();
-        AnchorSerialize::serialize(&market.admin, &mut previous_data).unwrap();
-        AnchorSerialize::serialize(&market.maker_group_bump, &mut previous_data).unwrap();
-        AnchorSerialize::serialize(&previous_makers, &mut previous_data).unwrap();
-        assert_eq!(serialized(&market), previous_data);
-        let decoded = Market::try_deserialize(&mut previous_data.as_slice()).unwrap();
-        for (id, maker) in previous_makers {
-            assert_eq!(decoded.maker(id.get()), Some(maker));
+            assert_eq!(serialized(&market).len(), full_size);
         }
     }
 }

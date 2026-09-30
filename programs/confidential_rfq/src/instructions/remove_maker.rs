@@ -17,9 +17,7 @@ pub struct RemoveMaker<'info> {
     #[account(
         mut,
         has_one = admin,
-        realloc = Market::space(market.maker_count().saturating_sub(1)),
-        realloc::payer = admin,
-        realloc::zero = false,
+        constraint = market.version == <Market as crate::CurrentAccountVersion>::VERSION @ crate::ConfidentialRfqError::InvalidRfqAccounts,
     )]
     pub market: Account<'info, Market>,
     /// CHECK: canonical market group PDA; signs the host revocation CPI.
@@ -33,7 +31,22 @@ pub struct RemoveMaker<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn remove_maker(ctx: Context<RemoveMaker>, maker_id: u64) -> Result<()> {
+pub fn remove_maker(ctx: Context<RemoveMaker>, maker_id: u32) -> Result<()> {
+    let maker = ctx
+        .accounts
+        .market
+        .active_maker(maker_id)
+        .ok_or(error!(crate::ConfidentialRfqError::MakerNotFound))?;
+    require_keys_eq!(
+        ctx.accounts.delegation_record.key(),
+        zama_host::user_decryption_delegation_address(
+            ctx.accounts.maker_group.key(),
+            maker,
+            Pubkey::new_from_array(zama_host::WILDCARD_AUTHORITY_BYTES),
+        )
+        .0,
+        crate::ConfidentialRfqError::InvalidRfqAccounts
+    );
     ctx.accounts.market.remove_maker(maker_id)?;
 
     let seeds = &market_maker_group_signer_seeds(&ctx.accounts.market);

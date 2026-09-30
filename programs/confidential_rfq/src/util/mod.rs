@@ -44,3 +44,5 @@ pub struct TransientStore<'a, 'info>(pub &'a UncheckedAccount<'info>);
 pub struct InstructionsAccount<'a, 'info>(pub &'a UncheckedAccount<'info>);
 #[derive(Copy, Clone, Debug, Deref)]
 pub struct HostConfig<'a, 'info>(pub &'a UncheckedAccount<'info>);
+mod encrypted_input;
+pub use encrypted_input::EncryptedInput;

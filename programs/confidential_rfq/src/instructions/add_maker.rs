@@ -11,13 +11,15 @@ use anchor_lang::prelude::*;
 use zama_host::program::ZamaHost;
 
 #[derive(Accounts)]
+#[instruction(maker_id: u32)]
 pub struct AddMaker<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
     #[account(
         mut,
         has_one = admin,
-        realloc = Market::space(market.maker_count() + 1),
+        constraint = market.version == <Market as crate::CurrentAccountVersion>::VERSION @ crate::ConfidentialRfqError::InvalidRfqAccounts,
+        realloc = Market::space(market.maker_count() + usize::from(market.maker(maker_id).is_none())),
         realloc::payer = admin,
         realloc::zero = false,
     )]
@@ -34,7 +36,7 @@ pub struct AddMaker<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn add_maker(ctx: Context<AddMaker>, maker_id: u64, maker: Pubkey) -> Result<()> {
+pub fn add_maker(ctx: Context<AddMaker>, maker_id: u32, maker: Pubkey) -> Result<()> {
     ctx.accounts.market.add_maker(maker_id, maker)?;
 
     let seeds = &market_maker_group_signer_seeds(&ctx.accounts.market);

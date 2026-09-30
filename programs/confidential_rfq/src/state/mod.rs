@@ -2,9 +2,9 @@ pub mod market;
 pub mod rfq;
 
 use anchor_lang::prelude::*;
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 
-pub type MakerId = NonZeroU64;
+pub type MakerId = NonZeroU32;
 
 pub const fn extend_key<const N: usize>(key: &[u8]) -> [u8; N] {
     let mut out = [0; N];

@@ -62,13 +62,32 @@ pub fn rfq_state_signer_seeds<'a>(rfq: &'a RFQ, scope: &'a [u8; 32]) -> [&'a [u8
     [prefix, market, user, nonce, bytes_of(&rfq.bump)]
 }
 
-pub fn bid_receipt_seeds<'a>(rfq: &'a AccountLoader<RFQ>, bid_index: &'a [u8; 8]) -> [&'a [u8]; 3] {
-    [b"bid_receipt", rfq.as_ref().key.as_ref(), bid_index]
+/// System-owned, data-empty account used to pay storage rent for this RFQ.
+pub fn rfq_funder_address(rfq: Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"rfq_funder", rfq.as_ref()], &crate::ID)
 }
 
-pub fn bid_receipt_address(rfq: &AccountLoader<RFQ>, bid_index: u64) -> (Pubkey, u8) {
+pub fn rfq_funder_signer_seeds<'a>(rfq: &'a Pubkey, bump: &'a u8) -> [&'a [u8]; 3] {
+    [b"rfq_funder", rfq.as_ref(), std::slice::from_ref(bump)]
+}
+
+/// Authority of a maker's separate encrypted store, scoped to this RFQ's nonce.
+pub fn maker_store_address(rfq: Pubkey, maker_id: u32) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &bid_receipt_seeds(rfq, &bid_index.to_le_bytes()),
+        &[b"rfq_maker_store", rfq.as_ref(), &maker_id.to_le_bytes()],
         &crate::ID,
     )
+}
+
+pub fn maker_store_signer_seeds<'a>(
+    rfq: &'a Pubkey,
+    maker_id: &'a [u8; 4],
+    bump: &'a u8,
+) -> [&'a [u8]; 4] {
+    [
+        b"rfq_maker_store",
+        rfq.as_ref(),
+        maker_id,
+        std::slice::from_ref(bump),
+    ]
 }

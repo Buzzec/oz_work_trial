@@ -1,16 +1,8 @@
 //! The accounts for one confidential token side of an RFQ.
 
-use crate::{
-    ConfidentialRfqError,
-    util::{
-        ConfidentialTokenEventAuthority, Contains, HostConfig, InstructionsAccount, TransientStore,
-        ZamaEventAuthority,
-    },
-};
+use crate::ConfidentialRfqError;
 use anchor_lang::prelude::*;
 use confidential_token as ct;
-use confidential_token::program::ConfidentialToken;
-use zama_host::program::ZamaHost;
 
 #[derive(Accounts)]
 pub struct TokenSide<'info> {
@@ -36,80 +28,87 @@ pub struct TokenSide<'info> {
 }
 impl<'info> TokenSide<'info> {
     pub fn validate(&self, user: Pubkey, authority: Pubkey) -> Result<()> {
-        let expected_user_token = ct::token_account_address(self.confidential_mint.key(), user).0;
-        let expected_user_store_address =
-            ct::encrypted_store_address(self.confidential_mint.key(), expected_user_token).0;
-
-        let expected_rfq_token =
-            ct::token_account_address(self.confidential_mint.key(), authority).0;
-        let expected_rfq_store_address =
-            ct::encrypted_store_address(self.confidential_mint.key(), expected_rfq_token).0;
-
-        require_keys_eq!(
-            self.participant_ata.key(),
-            expected_user_token,
-            ConfidentialRfqError::InvalidRfqAccounts
-        );
-        require_keys_eq!(
-            self.participant_balance_store.key(),
-            expected_user_store_address,
-            ConfidentialRfqError::InvalidRfqAccounts
-        );
-
-        require_keys_eq!(
-            self.rfq_ata.key(),
-            expected_rfq_token,
-            ConfidentialRfqError::InvalidRfqAccounts
-        );
-        require_keys_eq!(
-            self.rfq_balance_store.key(),
-            expected_rfq_store_address,
-            ConfidentialRfqError::InvalidRfqAccounts
-        );
-
-        Ok(())
-    }
-
-    pub fn initialize_escrow_account<'a, C>(
-        &self,
-        ctx: &'a C,
-        payer: &impl ToAccountInfo<'info>,
-        owner: &impl ToAccountInfo<'info>,
-        authority_seeds: &[&[u8]],
-    ) -> Result<()>
-    where
-        'info: 'a,
-        C: Contains<'a, &'a Program<'info, ConfidentialToken>>,
-        C: Contains<'a, ZamaEventAuthority<'a, 'info>>,
-        C: Contains<'a, ConfidentialTokenEventAuthority<'a, 'info>>,
-        C: Contains<'a, TransientStore<'a, 'info>>,
-        C: Contains<'a, InstructionsAccount<'a, 'info>>,
-        C: Contains<'a, HostConfig<'a, 'info>>,
-        C: Contains<'a, &'a Program<'info, System>>,
-        C: Contains<'a, &'a Program<'info, ZamaHost>>,
-    {
-        crate::util::cpi::initialize_token_account(
-            Contains::<&'a Program<'info, ConfidentialToken>>::get(ctx).key(),
-            ct::cpi::accounts::InitializeTokenAccount {
-                payer: payer.to_account_info(),
-                owner: owner.to_account_info(),
-                mint: self.confidential_mint.to_account_info(),
-                token_account: self.rfq_token_account.to_account_info(),
-                balance_encrypted_store: self.rfq_balance_store.to_account_info(),
-                zama_event_authority: Contains::<ZamaEventAuthority>::get(ctx).to_account_info(),
-                transient_store: Contains::<TransientStore>::get(ctx).to_account_info(),
-                instructions: Contains::<InstructionsAccount>::get(ctx).to_account_info(),
-                zama_program: Contains::<&'a Program<'info, ZamaHost>>::get(ctx).to_account_info(),
-                host_config: Contains::<HostConfig>::get(ctx).to_account_info(),
-                system_program: Contains::<&'a Program<'info, System>>::get(ctx).to_account_info(),
-                hcu_block_meter: None,
-                hcu_trusted_app_record: None,
-                event_authority: Contains::<ConfidentialTokenEventAuthority>::get(ctx)
-                    .to_account_info(),
-                program: Contains::<&'a Program<'info, ConfidentialToken>>::get(ctx)
-                    .to_account_info(),
-            },
-            &[authority_seeds],
+        validate_token_store(
+            &self.participant_token_account,
+            &self.participant_balance_store,
+            self.confidential_mint.key(),
+            user,
+            false,
+        )?;
+        validate_token_store(
+            &self.rfq_token_account,
+            &self.rfq_balance_store,
+            self.confidential_mint.key(),
+            authority,
+            true,
         )
     }
+
+    /// Accept an existing canonical escrow, including one permissionlessly prepared by
+    /// another caller. Funding happens only after its owner, mint, and host store are bound.
+    pub fn validate_prepared_escrow(&self, authority: Pubkey) -> Result<()> {
+        validate_token_store(
+            &self.rfq_token_account,
+            &self.rfq_balance_store,
+            self.confidential_mint.key(),
+            authority,
+            false,
+        )
+    }
+}
+
+/// Bind token ownership, mint, and balance storage. Initialized accounts supply their
+/// owner-checked canonical bumps, avoiding repeated PDA searches during every transfer.
+/// Only creation accepts empty escrow accounts, whose canonical addresses still get checked.
+fn validate_token_store(
+    token_account: &AccountInfo,
+    balance_store: &AccountInfo,
+    mint: Pubkey,
+    authority: Pubkey,
+    allow_empty: bool,
+) -> Result<()> {
+    if allow_empty && token_account.data_is_empty() {
+        let token = ct::token_account_address(mint, authority).0;
+        require!(
+            token_account.key() == token
+                && balance_store.key() == ct::encrypted_store_address(mint, token).0,
+            ConfidentialRfqError::InvalidRfqAccounts
+        );
+    } else {
+        require_keys_eq!(
+            *token_account.owner,
+            ct::ID,
+            ConfidentialRfqError::InvalidRfqAccounts
+        );
+        let token = ct::ConfidentialTokenAccount::try_deserialize(
+            &mut &token_account.try_borrow_data()?[..],
+        )?;
+        require!(
+            token.owner == authority && token.mint == mint,
+            ConfidentialRfqError::InvalidRfqAccounts
+        );
+        let token_key = Pubkey::create_program_address(
+            &[
+                b"token-account",
+                mint.as_ref(),
+                authority.as_ref(),
+                &[token.bump],
+            ],
+            &ct::ID,
+        )
+        .map_err(|_| error!(ConfidentialRfqError::InvalidRfqAccounts))?;
+        require!(
+            token_account.key() == token_key,
+            ConfidentialRfqError::InvalidRfqAccounts
+        );
+        let store = crate::util::rfq::read_encrypted_store(balance_store)?;
+        require!(
+            store.program == ct::ID
+                && store.authority == token_key
+                && store.scope == mint.to_bytes()
+                && store.get(&ct::balance_key()).is_some(),
+            ConfidentialRfqError::InvalidRfqAccounts
+        );
+    }
+    Ok(())
 }

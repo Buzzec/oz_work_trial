@@ -6,8 +6,6 @@ use zama_fhe::{ExecutionCpiAccounts, FheExecution, FheTyped, ReturningFheExecuti
 use zama_host::CoprocessorInputAttestation;
 
 use crate::ConfidentialRfqError;
-use crate::instructions::claim_maker::ClaimRfqMaker;
-use crate::instructions::claim_user::ClaimRfqUser;
 
 pub fn invoke<'info>(
     execution: FheExecution,
@@ -16,6 +14,16 @@ pub fn invoke<'info>(
     authorities: impl IntoIterator<Item = AccountInfo<'info>>,
     signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
+    let dynamic = dynamic.into_iter().filter(|account| {
+        execution.dynamic_account_requirements().any(|required| {
+            required.requires_dynamic_account() && required.pubkey() == account.key()
+        })
+    });
+    let authorities = authorities.into_iter().filter(|account| {
+        execution
+            .store_authority_requirements()
+            .any(|required| required.pubkey() == account.key())
+    });
     let resolved = execution
         .resolve_accounts(dynamic, authorities)
         .map_err(|error| {
@@ -68,6 +76,20 @@ pub fn invoke_returning<'info, T: FheTyped>(
     authorities: impl IntoIterator<Item = AccountInfo<'info>>,
     signer_seeds: &[&[&[u8]]],
 ) -> Result<[u8; 32]> {
+    let dynamic = dynamic.into_iter().filter(|account| {
+        execution
+            .execution()
+            .dynamic_account_requirements()
+            .any(|required| {
+                required.requires_dynamic_account() && required.pubkey() == account.key()
+            })
+    });
+    let authorities = authorities.into_iter().filter(|account| {
+        execution
+            .execution()
+            .store_authority_requirements()
+            .any(|required| required.pubkey() == account.key())
+    });
     let resolved = execution
         .execution()
         .resolve_accounts(dynamic, authorities)
@@ -90,58 +112,6 @@ pub fn transfer_from_grant<'info>(
     )
 }
 
-#[derive(Clone, Copy)]
-pub enum PayoutToken {
-    Asset,
-    Basis,
-}
-
-/// Spend a maker payout grant against the matching RFQ escrow token account.
-#[inline(never)]
-pub fn transfer_maker_payout<'info>(
-    ctx: &Context<'info, ClaimRfqMaker<'info>>,
-    authority_seeds: &[&[u8]],
-    handle: [u8; 32],
-    token: PayoutToken,
-) -> Result<()> {
-    let side = match token {
-        PayoutToken::Asset => &ctx.accounts.asset,
-        PayoutToken::Basis => &ctx.accounts.basis,
-    };
-    transfer_from_grant(
-        ctx.accounts.confidential_token_program.key(),
-        ct::cpi::accounts::ConfidentialTransferFromValue {
-            owner: ctx.accounts.rfq.to_account_info(),
-            payer: ctx.accounts.maker.to_account_info(),
-            mint: side.confidential_mint.to_account_info(),
-            underlying_mint: side.underlying_mint.to_account_info(),
-            from_ata: side.rfq_ata.to_account_info(),
-            to_ata: side.participant_ata.to_account_info(),
-            from_account: side.rfq_token_account.to_account_info(),
-            to_account: side.participant_token_account.to_account_info(),
-            from_store: side.rfq_balance_store.to_account_info(),
-            to_store: side.participant_balance_store.to_account_info(),
-            amount_store: None,
-            amount_authority: None,
-            zama_event_authority: ctx.accounts.zama_event_authority.to_account_info(),
-            transient_store: ctx.accounts.transient_store.to_account_info(),
-            instructions: ctx.accounts.instructions.to_account_info(),
-            zama_program: ctx.accounts.zama_program.to_account_info(),
-            host_config: ctx.accounts.host_config.to_account_info(),
-            system_program: ctx.accounts.system_program.to_account_info(),
-            hcu_block_meter: None,
-            hcu_trusted_app_record: None,
-            event_authority: ctx
-                .accounts
-                .confidential_token_event_authority
-                .to_account_info(),
-            program: ctx.accounts.confidential_token_program.to_account_info(),
-        },
-        &[authority_seeds],
-        handle,
-    )
-}
-
 pub fn transfer_attested<'info>(
     program: Pubkey,
     accounts: ct::cpi::accounts::ConfidentialTransfer<'info>,
@@ -157,52 +127,4 @@ pub fn transfer_attested<'info>(
     );
     data.try_into()
         .map_err(|_| error!(ConfidentialRfqError::InvalidTransferResult))
-}
-
-/// Spend both encrypted user payout grants from the RFQ escrow accounts.
-#[inline(never)]
-pub fn transfer_user_payouts<'info>(
-    ctx: &Context<'info, ClaimRfqUser<'info>>,
-    authority_seeds: &[&[u8]],
-    asset_handle: [u8; 32],
-    basis_handle: [u8; 32],
-) -> Result<()> {
-    for (side, handle) in [
-        (&ctx.accounts.asset, asset_handle),
-        (&ctx.accounts.basis, basis_handle),
-    ] {
-        transfer_from_grant(
-            ctx.accounts.confidential_token_program.key(),
-            ct::cpi::accounts::ConfidentialTransferFromValue {
-                owner: ctx.accounts.rfq.to_account_info(),
-                payer: ctx.accounts.user.to_account_info(),
-                mint: side.confidential_mint.to_account_info(),
-                underlying_mint: side.underlying_mint.to_account_info(),
-                from_ata: side.rfq_ata.to_account_info(),
-                to_ata: side.participant_ata.to_account_info(),
-                from_account: side.rfq_token_account.to_account_info(),
-                to_account: side.participant_token_account.to_account_info(),
-                from_store: side.rfq_balance_store.to_account_info(),
-                to_store: side.participant_balance_store.to_account_info(),
-                amount_store: None,
-                amount_authority: None,
-                zama_event_authority: ctx.accounts.zama_event_authority.to_account_info(),
-                transient_store: ctx.accounts.transient_store.to_account_info(),
-                instructions: ctx.accounts.instructions.to_account_info(),
-                zama_program: ctx.accounts.zama_program.to_account_info(),
-                host_config: ctx.accounts.host_config.to_account_info(),
-                system_program: ctx.accounts.system_program.to_account_info(),
-                hcu_block_meter: None,
-                hcu_trusted_app_record: None,
-                event_authority: ctx
-                    .accounts
-                    .confidential_token_event_authority
-                    .to_account_info(),
-                program: ctx.accounts.confidential_token_program.to_account_info(),
-            },
-            &[authority_seeds],
-            handle,
-        )?;
-    }
-    Ok(())
 }

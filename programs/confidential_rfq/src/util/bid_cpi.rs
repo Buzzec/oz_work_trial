@@ -1,202 +1,207 @@
-//! CPI plumbing for one public PlaceBid operation. The FHE price, funding,
-//! and winner calculations remain in the instruction module.
+//! Account assembly shared by the bidding phases. FHE decisions stay in PlaceBid.
 
-use crate::instructions::place_bid::PlaceBid;
-use crate::util::cpi;
+use crate::{ConfidentialRfqError, instructions::place_bid::PlaceBid, util::cpi};
 use anchor_lang::prelude::*;
 use confidential_token as ct;
-use zama_fhe::{ExecutionCpiAccounts, FheExecution, Uint};
-use zama_host::CoprocessorInputAttestation;
+use zama_fhe::{ExecutionCpiAccounts, FheTyped, ReturningFheExecution, Uint};
 
-#[inline(never)]
-pub(crate) fn invoke_bid_execution<'info>(
+pub(crate) fn invoke_returning_bid_execution<'info, T: FheTyped>(
     ctx: &Context<'info, PlaceBid<'info>>,
-    execution: FheExecution,
-    authority_seeds: &[&[u8]],
-) -> Result<()> {
-    cpi::invoke(
-        execution,
-        ExecutionCpiAccounts {
-            payer: ctx.accounts.maker.to_account_info(),
-            authority: ctx.accounts.rfq.to_account_info(),
-            host_config: ctx.accounts.host_config.to_account_info(),
-            deny_scope_records: ctx.remaining_accounts.to_vec(),
-            system_program: ctx.accounts.system_program.to_account_info(),
-            hcu_block_meter: ctx
-                .accounts
-                .hcu_block_meter
-                .as_ref()
-                .map(ToAccountInfo::to_account_info),
-            hcu_trusted_app_record: ctx
-                .accounts
-                .hcu_trusted_app_record
-                .as_ref()
-                .map(ToAccountInfo::to_account_info),
-            rand_nonce: None,
-            event_authority: ctx.accounts.zama_event_authority.to_account_info(),
-            transient_store: ctx.accounts.transient_store.to_account_info(),
-            instructions: ctx.accounts.instructions.to_account_info(),
-            program: ctx.accounts.zama_program.to_account_info(),
-        },
-        [ctx.accounts.rfq_store.to_account_info()],
-        [ctx.accounts.rfq.to_account_info()],
-        &[authority_seeds],
-    )
-}
-
-#[inline(never)]
-pub(crate) fn invoke_returning_bid_execution<'info>(
-    ctx: &Context<'info, PlaceBid<'info>>,
-    execution: zama_fhe::ReturningFheExecution<Uint<64>>,
-    authority_seeds: &[&[u8]],
+    execution: ReturningFheExecution<T>,
+    signer_seeds: &[&[&[u8]]],
 ) -> Result<[u8; 32]> {
-    let mut dynamic = vec![ctx.accounts.rfq_store.to_account_info()];
-    for required in execution.execution().dynamic_account_requirements() {
-        if !required.requires_dynamic_account() || required.pubkey() == ctx.accounts.rfq_store.key()
-        {
-            continue;
-        }
-        if required.pubkey() == ctx.accounts.rfq_asset_balance_store.key() {
-            dynamic.push(ctx.accounts.rfq_asset_balance_store.to_account_info());
-        } else if required.pubkey() == ctx.accounts.rfq_basis_balance_store.key() {
-            dynamic.push(ctx.accounts.rfq_basis_balance_store.to_account_info());
-        }
-    }
+    // The shared resolver filters these witnesses once against the execution.
+    let dynamic = [
+        ctx.accounts.rfq_store.to_account_info(),
+        ctx.accounts.maker_store.to_account_info(),
+        ctx.accounts
+            .asset
+            .participant_balance_store
+            .to_account_info(),
+        ctx.accounts.asset.rfq_balance_store.to_account_info(),
+        ctx.accounts
+            .basis
+            .participant_balance_store
+            .to_account_info(),
+        ctx.accounts.basis.rfq_balance_store.to_account_info(),
+    ];
+    let authorities = [
+        ctx.accounts.rfq.to_account_info(),
+        ctx.accounts.maker_authority.to_account_info(),
+    ];
     cpi::invoke_returning(
         execution,
-        ExecutionCpiAccounts {
-            payer: ctx.accounts.maker.to_account_info(),
-            authority: ctx.accounts.rfq.to_account_info(),
-            host_config: ctx.accounts.host_config.to_account_info(),
-            deny_scope_records: ctx.remaining_accounts.to_vec(),
-            system_program: ctx.accounts.system_program.to_account_info(),
-            hcu_block_meter: ctx
-                .accounts
-                .hcu_block_meter
-                .as_ref()
-                .map(ToAccountInfo::to_account_info),
-            hcu_trusted_app_record: ctx
-                .accounts
-                .hcu_trusted_app_record
-                .as_ref()
-                .map(ToAccountInfo::to_account_info),
-            rand_nonce: None,
-            event_authority: ctx.accounts.zama_event_authority.to_account_info(),
-            transient_store: ctx.accounts.transient_store.to_account_info(),
-            instructions: ctx.accounts.instructions.to_account_info(),
-            program: ctx.accounts.zama_program.to_account_info(),
-        },
+        execution_accounts(ctx),
         dynamic,
-        [ctx.accounts.rfq.to_account_info()],
-        &[authority_seeds],
+        authorities,
+        signer_seeds,
     )
 }
 
-pub(crate) fn transfer_token<'info>(
-    ctx: &Context<'info, PlaceBid<'info>>,
-    attestation: CoprocessorInputAttestation,
-    asset: bool,
-) -> Result<[u8; 32]> {
-    let (mint, underlying, maker_ata, rfq_ata, maker_token, rfq_token, maker_store, rfq_balance) =
-        if asset {
-            (
-                &ctx.accounts.asset_confidential_mint,
-                &ctx.accounts.asset_underlying_mint,
-                &ctx.accounts.maker_asset_ata,
-                &ctx.accounts.rfq_asset_ata,
-                &ctx.accounts.maker_asset_token_account,
-                &ctx.accounts.rfq_asset_token_account,
-                &ctx.accounts.maker_asset_balance_store,
-                &ctx.accounts.rfq_asset_balance_store,
-            )
-        } else {
-            (
-                &ctx.accounts.basis_confidential_mint,
-                &ctx.accounts.basis_underlying_mint,
-                &ctx.accounts.maker_basis_ata,
-                &ctx.accounts.rfq_basis_ata,
-                &ctx.accounts.maker_basis_token_account,
-                &ctx.accounts.rfq_basis_token_account,
-                &ctx.accounts.maker_basis_balance_store,
-                &ctx.accounts.rfq_basis_balance_store,
-            )
-        };
-    cpi::transfer_attested(
-        ctx.accounts.confidential_token_program.key(),
-        ct::cpi::accounts::ConfidentialTransfer {
-            owner: ctx.accounts.maker.to_account_info(),
-            payer: ctx.accounts.maker.to_account_info(),
-            mint: mint.to_account_info(),
-            underlying_mint: underlying.to_account_info(),
-            from_ata: maker_ata.to_account_info(),
-            to_ata: rfq_ata.to_account_info(),
-            from_account: maker_token.to_account_info(),
-            to_account: rfq_token.to_account_info(),
-            from_store: maker_store.to_account_info(),
-            to_store: rfq_balance.to_account_info(),
-            zama_event_authority: ctx.accounts.zama_event_authority.to_account_info(),
-            transient_store: ctx.accounts.transient_store.to_account_info(),
-            instructions: ctx.accounts.instructions.to_account_info(),
-            zama_program: ctx.accounts.zama_program.to_account_info(),
-            host_config: ctx.accounts.host_config.to_account_info(),
-            system_program: ctx.accounts.system_program.to_account_info(),
-            hcu_block_meter: None,
-            hcu_trusted_app_record: None,
-            result_store: Some(ctx.accounts.rfq_store.to_account_info()),
-            event_authority: ctx
-                .accounts
-                .confidential_token_event_authority
-                .to_account_info(),
-            program: ctx.accounts.confidential_token_program.to_account_info(),
-        },
-        attestation,
-    )
+/// Results privately shared from the asset phase to the basis phase.
+#[derive(Clone, Copy)]
+pub(crate) struct BidContinuation {
+    pub prices: [u8; 32],
+    pub previous_sell_positive: [u8; 32],
 }
 
+/// The asset circuit's first and last results carry verified prices and the
+/// previous sell activity. Bind both to the exact journal append, RFQ producer,
+/// expected type, and permission before the basis phase consumes them.
 #[inline(never)]
-pub(crate) fn refund_token<'info>(
+pub(crate) fn invoke_asset_bid_execution<'info>(
+    ctx: &Context<'info, PlaceBid<'info>>,
+    execution: ReturningFheExecution<Uint<64>>,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<([u8; 32], BidContinuation)> {
+    use crate::util::rfq::read_journal;
+    let before = read_journal(ctx.accounts.transient_store.as_ref())?.len();
+    let steps = execution.execution().cost().steps;
+    require!(steps >= 2, ConfidentialRfqError::InvalidTransferResult);
+    let expected_len = before
+        .checked_add(steps)
+        .ok_or(error!(ConfidentialRfqError::InvalidTransferResult))?;
+    let refund = invoke_returning_bid_execution(ctx, execution, signer_seeds)?;
+    let journal = read_journal(ctx.accounts.transient_store.as_ref())?;
+    require!(
+        journal.len() == expected_len,
+        ConfidentialRfqError::InvalidTransferResult
+    );
+    let prices = journal
+        .result(before)
+        .ok_or(error!(ConfidentialRfqError::InvalidTransferResult))?;
+    let previous_sell = journal
+        .result(expected_len - 1)
+        .ok_or(error!(ConfidentialRfqError::InvalidTransferResult))?;
+    for (result, expected_type) in [(prices, 6), (previous_sell, 0)] {
+        require!(
+            result.producer_store == ctx.accounts.rfq_store.key()
+                && result.handle[30] == expected_type
+                && journal
+                    .authorized_depth(result.handle, ctx.accounts.rfq_store.key())
+                    .is_some(),
+            ConfidentialRfqError::InvalidTransferResult
+        );
+    }
+    Ok((
+        refund,
+        BidContinuation {
+            prices: prices.handle,
+            previous_sell_positive: previous_sell.handle,
+        },
+    ))
+}
+
+fn execution_accounts<'info>(ctx: &Context<'info, PlaceBid<'info>>) -> ExecutionCpiAccounts<'info> {
+    ExecutionCpiAccounts {
+        payer: ctx.accounts.rfq_funder.to_account_info(),
+        authority: ctx.accounts.rfq.to_account_info(),
+        host_config: ctx.accounts.host_config.to_account_info(),
+        deny_scope_records: ctx.remaining_accounts.to_vec(),
+        system_program: ctx.accounts.system_program.to_account_info(),
+        hcu_block_meter: ctx
+            .accounts
+            .hcu_block_meter
+            .as_ref()
+            .map(ToAccountInfo::to_account_info),
+        hcu_trusted_app_record: ctx
+            .accounts
+            .hcu_trusted_app_record
+            .as_ref()
+            .map(ToAccountInfo::to_account_info),
+        rand_nonce: None,
+        event_authority: ctx.accounts.zama_event_authority.to_account_info(),
+        transient_store: ctx.accounts.transient_store.to_account_info(),
+        instructions: ctx.accounts.instructions.to_account_info(),
+        program: ctx.accounts.zama_program.to_account_info(),
+    }
+}
+
+/// Deposit the attested maker amount and grant the actual transferred handle to
+/// the RFQ. The FHE acceptance circuit checks the required delta and refunds any
+/// deposit that does not fund an admissible change exactly.
+#[inline(never)]
+pub(crate) fn transfer_deposit<'info>(
+    ctx: &Context<'info, PlaceBid<'info>>,
+    attestation: zama_host::CoprocessorInputAttestation,
+    asset: bool,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<[u8; 32]> {
+    let side = if asset {
+        &ctx.accounts.asset
+    } else {
+        &ctx.accounts.basis
+    };
+    ct::cpi::confidential_transfer(
+        CpiContext::new_with_signer(
+            ctx.accounts.confidential_token_program.key(),
+            ct::cpi::accounts::ConfidentialTransfer {
+                owner: ctx.accounts.maker.to_account_info(),
+                payer: ctx.accounts.rfq_funder.to_account_info(),
+                mint: side.confidential_mint.to_account_info(),
+                underlying_mint: side.underlying_mint.to_account_info(),
+                from_ata: side.participant_ata.to_account_info(),
+                to_ata: side.rfq_ata.to_account_info(),
+                from_account: side.participant_token_account.to_account_info(),
+                to_account: side.rfq_token_account.to_account_info(),
+                from_store: side.participant_balance_store.to_account_info(),
+                to_store: side.rfq_balance_store.to_account_info(),
+                zama_event_authority: ctx.accounts.zama_event_authority.to_account_info(),
+                transient_store: ctx.accounts.transient_store.to_account_info(),
+                instructions: ctx.accounts.instructions.to_account_info(),
+                zama_program: ctx.accounts.zama_program.to_account_info(),
+                host_config: ctx.accounts.host_config.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                hcu_block_meter: None,
+                hcu_trusted_app_record: None,
+                result_store: Some(ctx.accounts.rfq_store.to_account_info()),
+                event_authority: ctx
+                    .accounts
+                    .confidential_token_event_authority
+                    .to_account_info(),
+                program: ctx.accounts.confidential_token_program.to_account_info(),
+            },
+            signer_seeds,
+        ),
+        attestation,
+    )?;
+    let (producer, data) = anchor_lang::solana_program::program::get_return_data()
+        .ok_or(ConfidentialRfqError::InvalidTransferResult)?;
+    require_keys_eq!(
+        producer,
+        ct::ID,
+        ConfidentialRfqError::InvalidTransferResult
+    );
+    data.try_into()
+        .map_err(|_| error!(ConfidentialRfqError::InvalidTransferResult))
+}
+
+/// Refund a computed amount from RFQ escrow with the RFQ PDA's signature.
+#[inline(never)]
+pub(crate) fn refund_collateral<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     handle: [u8; 32],
     asset: bool,
-    authority_seeds: &[&[u8]],
+    signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
-    let (mint, underlying, maker_ata, rfq_ata, maker_token, rfq_token, maker_store, rfq_balance) =
-        if asset {
-            (
-                &ctx.accounts.asset_confidential_mint,
-                &ctx.accounts.asset_underlying_mint,
-                &ctx.accounts.maker_asset_ata,
-                &ctx.accounts.rfq_asset_ata,
-                &ctx.accounts.maker_asset_token_account,
-                &ctx.accounts.rfq_asset_token_account,
-                &ctx.accounts.maker_asset_balance_store,
-                &ctx.accounts.rfq_asset_balance_store,
-            )
-        } else {
-            (
-                &ctx.accounts.basis_confidential_mint,
-                &ctx.accounts.basis_underlying_mint,
-                &ctx.accounts.maker_basis_ata,
-                &ctx.accounts.rfq_basis_ata,
-                &ctx.accounts.maker_basis_token_account,
-                &ctx.accounts.rfq_basis_token_account,
-                &ctx.accounts.maker_basis_balance_store,
-                &ctx.accounts.rfq_basis_balance_store,
-            )
-        };
+    let side = if asset {
+        &ctx.accounts.asset
+    } else {
+        &ctx.accounts.basis
+    };
     cpi::transfer_from_grant(
         ctx.accounts.confidential_token_program.key(),
         ct::cpi::accounts::ConfidentialTransferFromValue {
             owner: ctx.accounts.rfq.to_account_info(),
-            payer: ctx.accounts.maker.to_account_info(),
-            mint: mint.to_account_info(),
-            underlying_mint: underlying.to_account_info(),
-            from_ata: rfq_ata.to_account_info(),
-            to_ata: maker_ata.to_account_info(),
-            from_account: rfq_token.to_account_info(),
-            to_account: maker_token.to_account_info(),
-            from_store: rfq_balance.to_account_info(),
-            to_store: maker_store.to_account_info(),
+            payer: ctx.accounts.rfq_funder.to_account_info(),
+            mint: side.confidential_mint.to_account_info(),
+            underlying_mint: side.underlying_mint.to_account_info(),
+            from_ata: side.rfq_ata.to_account_info(),
+            to_ata: side.participant_ata.to_account_info(),
+            from_account: side.rfq_token_account.to_account_info(),
+            to_account: side.participant_token_account.to_account_info(),
+            from_store: side.rfq_balance_store.to_account_info(),
+            to_store: side.participant_balance_store.to_account_info(),
             amount_store: None,
             amount_authority: None,
             zama_event_authority: ctx.accounts.zama_event_authority.to_account_info(),
@@ -213,7 +218,7 @@ pub(crate) fn refund_token<'info>(
                 .to_account_info(),
             program: ctx.accounts.confidential_token_program.to_account_info(),
         },
-        &[authority_seeds],
+        signer_seeds,
         handle,
     )
 }
