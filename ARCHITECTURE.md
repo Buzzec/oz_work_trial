@@ -1,11 +1,11 @@
 # Concepts
 
-| Concept | Description                                                                                                    |
-|---------|----------------------------------------------------------------------------------------------------------------|
-| Market  | A set of valid makers, a user makes a RFQ against a specific market.                                           |
-| Admin   | Can approvce makers on the market they are admin of and add tokens. Creates the market                         |
-| Maker   | Approved by admins. Can see sizes of requests and place bids on requests in their market. Indexed by `u64` id. |
-| User    | Can plce RFQs against any market, does not require approval.                                                   |
+| Concept | Description                                                                                                     |
+|---------|-----------------------------------------------------------------------------------------------------------------|
+| Market  | A set of valid makers, a user makes a RFQ against a specific market.                                            |
+| Admin   | Can approve makers on the market they are admin of and add tokens. Creates the market.                          |
+| Maker   | Approved by admins. Can see sizes of requests and place bids on requests in their market. Indexed by `MakerId`. |
+| User    | Can place RFQs against any market, does not require approval.                                                   |
 
 # Accounts
 
@@ -15,71 +15,74 @@
 
 Optional versions of these ids are `u32`s, with `0` representing `None`.
 
-Markets start with an empty maker vector sorted by ID. `Market` methods provide lookup, insertion, removal, and membership counts. Adding or removing a maker reallocates the account to fit the current membership; the admin pays additional rent on growth and receives the unused rent on shrinkage.
-
 | Field            | Type                           | Description                                                                                                                        |
 |------------------|--------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
 | Admin            | `Pubkey`                       | The admin for this market.                                                                                                         |
-| Maker Group Bump | `u8`                           | The bump seed for the maker group's pda                                                                                            |
+| Maker Group Bump | `u8`                           | The bump seed for the maker group's PDA.                                                                                           |
 | Makers           | `Vec<(MakerId, Pubkey, bool)>` | Approved makers sorted by nonzero ID, with each entry containing a `u32` ID and a `Pubkey` with `bool` for whether they're active. |
 
 ## RFQ
 
-| Field       | Type       | Description                                                                                  |
-|-------------|------------|----------------------------------------------------------------------------------------------|
-| Nonce       | `[u8; 32]` | Random nonce to prevent account replacement attacks. Derived from input handles on creation. |
-| Bump        | `u8`       | The bump for the RFQ.                                                                        |
-| Funder Bump | `u8`       | The bump for the account that holds funds for rent.                                          |
-| Market      | `Pubkey`   | The market the RFQ is against.                                                               |
-| User        | `Pubkey`   | The user that placed the RFQ.                                                                |
-| Asset Token | `Pubkey`   | The token that is being bought/sold.                                                         |
-| Basis Token | `Pubkey`   | The token used as currency.                                                                  |
+| Field       | Type       | Description                                                                                                                                   |
+|-------------|------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| Nonce       | `[u8; 32]` | Random nonce to prevent account replacement attacks. Derived from input handles on creation.                                                  |
+| Bump        | `u8`       | The bump for the RFQ.                                                                                                                         |
+| Funder Bump | `u8`       | The bump for the account that holds funds for rent.                                                                                           |
+| Open Stores | `u32`      | Public `open_stores` count of the RFQ's open primary and maker stores. Incremented on creation and decremented only after successful closure. |
+| Market      | `Pubkey`   | The market the RFQ is against.                                                                                                                |
+| User        | `Pubkey`   | The user that placed the RFQ.                                                                                                                 |
+| Asset Token | `Pubkey`   | The token that is being bought/sold.                                                                                                          |
+| Basis Token | `Pubkey`   | The token used as currency.                                                                                                                   |
 
 ### Private Fields
 
 #### Primary Store
 
-| Field            | ID                 | Type                 | Description                                                                                           | Revealed To     |
-|------------------|--------------------|----------------------|-------------------------------------------------------------------------------------------------------|-----------------|
-| State            | `state`            | `u8`                 | The state of the RFQ.                                                                                 | Public          |
-| Timeout          | `expire_timestamp` | `UnixTimestamp`      | When the RFQ expires.                                                                                 | User and Makers |
-| Bid Count        | `bid_count`        | `u32`                | The amount of valid bids.                                                                             | Public          |
-| Bid Seq          | `bid_seq`          | `u32`                | Monotomically increasing sequence id, used to break ties.                                             | Public          |
-| Searched Bids    | `searched_bids`    | `u32`                | The number of bids that have been searched to find the best bid.                                      | Public          |
-| User Is Buyer    | `user_buyer`       | `bool`               | True if the user escrows the basis token, false if the user escrows the asset token.                  | User            |
-| Offer Limit      | `offer_limit`      | `u64`                | Any offer below/above this is rejected, based on whether the user is the buyer or seller.             | User            |
-| Size             | `size`             | `u64`                | The amount of asset sub-tokens the user wishes to buy/sell.                                           | User and Makers |
-| Best Offer       | `best_offer`       | `u64`                | The best conter sub-token amount a maker has made.                                                    | None            |
-| Best Maker       | `best_maker`       | `Option<MakerId>`    | The maker that offered the best offer. If `0` (`Option::None`), no maker has made a good enough offer | None            |
-| Best Maker Index | `best_maker_index` | `Option<NonZeroU32>` | The index of the best maker, used to break ties.                                                      | None            |
+| Field            | ID                 | Type                 | Description                                                                                                               | Revealed To     |
+|------------------|--------------------|----------------------|---------------------------------------------------------------------------------------------------------------------------|-----------------|
+| State            | `state`            | `u8`                 | The state of the RFQ.                                                                                                     | Public          |
+| Timeout          | `expire_timestamp` | `UnixTimestamp`      | When the RFQ expires.                                                                                                     | User and Makers |
+| Bid Count        | `bid_count`        | `u32`                | The amount of valid bids.                                                                                                 | Public          |
+| Bid Seq          | `bid_seq`          | `u32`                | Monotonically increasing sequence ID, used to break ties.                                                                 | Public          |
+| Searched Bids    | `searched_bids`    | `u32`                | The number of bids that have been searched to find the best bid.                                                          | Public          |
+| User Is Buyer    | `user_buyer`       | `bool`               | True if the user escrows the basis token, false if the user escrows the asset token.                                      | User            |
+| Offer Limit      | `offer_limit`      | `u64`                | Total basis sub-token limit for trading `size` asset sub-tokens: the buyer's maximum payment or seller's minimum receipt. | User            |
+| Size             | `size`             | `u64`                | The amount of asset sub-tokens the user wishes to buy/sell.                                                               | User and Makers |
+| Best Offer       | `best_offer`       | `u64`                | Total basis sub-token payment for the winning trade of `size` asset sub-tokens.                                           | None            |
+| Best Maker       | `best_maker`       | `Option<MakerId>`    | The maker that offered the best offer. If `0` (`Option::None`), no maker has made a good enough offer                     | None            |
+| Best Maker Index | `best_maker_index` | `Option<NonZeroU32>` | The index of the best maker, used to break ties.                                                                          | None            |
 
 #### Maker Store
 
 Must be separate since there's a max of 32 fields.
 
-| Field       | ID           | Type                 | Description                                                                                                                                                      | Revealed To |
-|-------------|--------------|----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|
-| Maker Buy   | `maker_buy`  | `u64`                | The amount of basis sub-tokens the maker wants to buy the asset tokens for. Succeeds if "user_buyer" is false and is greater than "offer_limit" and "best_offer" | Maker(id)   |
-| Maker Sell  | `maker_sell` | `u64`                | The amount of basis sub-tokens the maker wants to sell asset tokens for. Succeeds if "user_buyer" is true and is less than "offer_limit" and "best_offer"        | Maker(id)   |
-| Maker Index | `maker_seq`  | `Option<NonZeroU32>` | The `bid_seq + 1` of when the maker placed their bid. Should be set to `bid_seq + 1`. If `0`, then this means this bid has been searched already.                | Public      |
+| Field          | ID           | Type                 | Description                                                                                                                                                                                                                                                         | Revealed To |
+|----------------|--------------|----------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|
+| Maker Buy      | `maker_buy`  | `u64`                | Total basis sub-tokens offered to buy `size` asset sub-tokens; also the required basis collateral. Eligible when nonzero, `user_buyer` is false, and the offer exceeds `offer_limit`. The highest eligible offer wins.                                              | Maker(id)   |
+| Maker Sell     | `maker_sell` | `u64`                | Total basis sub-tokens requested to sell `size` asset sub-tokens. Required asset collateral is `size` when this quote is nonzero, otherwise `0`. Eligible when nonzero, `user_buyer` is true, and the offer is below `offer_limit`. The lowest eligible offer wins. | Maker(id)   |
+| Maker Sequence | `maker_seq`  | `Option<NonZeroU32>` | Set to `bid_seq + 1` when the maker submits or changes a bid. `0` marks a bid that has already been searched.                                                                                                                                                       | Public      |
 
 ### Private Tokens
 
-The RFQ owns both asset and basis tokens. The makers deposit both, sufficient to cover both sides of the trade. The user only deposits the token they need to, but the creation process still needs a token account that it withdraws 0 tokens from to maintain privacy.
+The RFQ owns both asset and basis tokens. Each maker escrows `maker_buy` basis sub-tokens and, when `maker_sell` is nonzero, `size` asset sub-tokens. Both quotes are total basis-token amounts for the same asset quantity; the sell quote is the payment requested, not the amount of asset collateral. A zero quote requires zero collateral for that side. Maker collateral is independent of the user's private side.
+
+The user escrows `offer_limit` basis sub-tokens when buying or `size` asset sub-tokens when selling. Creation still transfers `0` from the other token account to maintain privacy.
 
 ### Privacy
 
-- User: The user is public because solana would track who opened the account anyway. This could be hidden with a complex batching system that tracks users by ID and publishes RFQs in batches, but I'm calling that out of scope.
+- User: The user is public because Solana would track who opened the account anyway. This could be hidden with a complex batching system that tracks users by ID and publishes RFQs in batches, but I'm calling that out of scope.
 - Tokens Involved: It would be possible to encrypt the tokens involved in the trade, but the confidential token program does not support encrypting what tokens are stored in each account.
-- Maker bid count: We could make this private, but it would be trivially easy to recreate based on transaction history.
-- Timeout: We need to keep this public for bookkeeping reasons, it could be made private if doing rent properly
+- Maker bid count: The active bid count is publicly decryptable. Transaction history reveals bid submissions, but does not by itself reveal whether their confidential transfers succeeded.
+- Timeout: The timestamp is revealed only to the User and Makers. Expiry comparisons happen in FHE operations.
 
 # PDAs
 
 - Maker Decryption Group: `"market_maker_group"` + `KeyFor<Market>`
 - RFQ: `"rfq"` + `KeyFor<Market>` + `KeyFor<User>` + `nonce`
 - RFQ Funder: `"rfq_funder"` + `KeyFor<RFQ>`
+    - System program owned, funds only.
 - Maker Store `"rfq_maker_store"` + `KeyFor<RFQ>` + `maker_id`
+    - Authority for the store.
 
 # Operations
 
@@ -97,7 +100,7 @@ The RFQ owns both asset and basis tokens. The makers deposit both, sufficient to
 ### Create Market
 
 - Creates a new `Market` account with the creator as the admin.
-- Initializes the maker decryption group at the `Market`'s PDA (not much to do).
+- Initializes the maker decryption group at the Maker Decryption Group PDA (not much to do).
 
 ### Add Maker
 
@@ -109,17 +112,17 @@ The RFQ owns both asset and basis tokens. The makers deposit both, sufficient to
 ### Remove Maker
 
 - Disables a maker's public key from the `Market` by marking it disabled. This stops them from placing new bids.
-- Remove the maker's public ket from the `Market`'s maker decryption group.
+- Removes the maker's public key from the `Market`'s maker decryption group.
 
 ### Request Quote
 
 - Callable by anyone, the caller becomes the User.
 - User opens a new PDA with seeds: `Market` key, User key, and the input handle from one of the inputs to nonce the account and prevent account replacement attacks.
-- Transfer extra rent to the `RFQ` sufficient to support `x` bids, where `x` is supplied by the user.
+- Transfer extra rent to the RFQ Funder sufficient to support `x` bids, where `x` is supplied by the user.
     - This is not immediately transferred to the private store account to help with bookkeeping.
-    - A user can later add support for more bids by transferring to the `RFQ`.
-- Initializes all private fields with default values.
-    - We can't initialize later as that would require more rent.
+    - A user can later add support for more bids by transferring to the RFQ Funder.
+- Creates the primary store, initializes its fields, and sets `open_stores` to `1`.
+    - Maker stores are created and initialized with zero/default values on their maker's first bid submission, using the prefunded rent.
 - Transfer either `offer_limit` or `size` tokens based on the side of the `RFQ` to the `RFQ`, the other transferring `0`.
 - Check the expiry timestamp is valid privately, must be less than the current time + `MAXIMUM_TIMEOUT`.
 - If invalid (`size == 0` OR `offer_limit == 0` OR the user didn't have enough tokens OR the timestamp is too far out):
@@ -130,14 +133,20 @@ The RFQ owns both asset and basis tokens. The makers deposit both, sufficient to
 
 - Callable only by the User.
 - `RFQ` must be in the `Valid` state.
-- If `expire_timestamp` has not passed: The User marks the state as `Cancelled` and recovers all tokens.
+- If `expire_timestamp` has not passed: The User marks the state as `Canceled` and recovers all tokens.
 
 ### Place Bid
 
 - Callable by a Maker on the `Market`.
 - The `RFQ` must be in the `Valid` state AND the Maker must be active (not removed).
-- Transfer the difference of both offered amount (buy and sell) from the previous offer (defaults to `0` as the previous offer) to the `RFQ`.
-- Store the size of both offer sides and the index of the maker (for ordering who wins ties).
+- Creates the maker's store if it does not exist, initializes its fields, and increments `open_stores` exactly once for that creation.
+- Adjust collateral against the previous accepted quotes (both default to `0`):
+    - Basis collateral is `maker_buy`.
+    - Asset collateral is `size` when `maker_sell` is nonzero, otherwise `0`. Changing a nonzero sell quote to another nonzero value does not change the asset collateral.
+    - Deposit any increase in collateral into the RFQ; refund any decrease to the maker. These amounts are selected in FHE operations.
+    - If `expire_timestamp` has passed, select `0` for both deposits and refunds and retain the previous quotes.
+- Store both quote amounts and the maker's sequence (for ordering who wins ties).
+    - The seq id is updated if the bid is changed, even if an invalid change.
     - The payer for this is the `RFQ`'s funder (`funder_bump`).
     - This ensures the Maker does not pay rent for their bid.
 - If invalid (not enough tokens for the claimed bid OR `expire_timestamp` has passed):
@@ -151,6 +160,7 @@ The RFQ owns both asset and basis tokens. The makers deposit both, sufficient to
     - Increment `bid_count`
 - If either side was previously non-`0` and both sides are now `0`:
     - Decrement `bid_count`
+- Increment `bid_seq`
 
 ### Expire RFQ
 
@@ -186,16 +196,26 @@ The RFQ owns both asset and basis tokens. The makers deposit both, sufficient to
 - Callable by anyone (usually the maker) passing a specific maker id.
 - State must be `Claimed`, `Claimable`, `Canceled`, or `Invalid` and at least one side must be non-zero.
 - Transfers the tokens to the maker.
-    - If `best_maker` is the maker's id then transfers the opposite of their trade (the opposite side's deposit gets transferred back).
-    - Otherwise, transfers their original deposit.
+    - If `best_maker` is the maker's ID, pays `best_offer` basis sub-tokens when the maker sells, or `size` asset sub-tokens when the maker buys, and refunds the unused collateral for the maker's other quote.
+    - Otherwise, refunds the maker's basis and asset collateral.
 - Sets both bid sides to `0`.
 - Decrements `bid_count`.
 
-### Close RFQ
+### Close Stores (`close_stores`)
+
+- Callable by anyone, supplying one or more of this RFQ's stores.
+- Before closing any stores, verifies through the primary store that the state is `Claimed`, `Canceled`, or `Invalid` and `bid_count` is `0`.
+- Validates each supplied store belongs to this RFQ, is still open, and appears only once in the call.
+- Closes maker stores first, returning their rent to the User. Decrements `open_stores` once per successfully closed store; canceled bids still have stores that must be closed.
+- Closes the primary store last, only when it is the sole remaining open store (`open_stores == 1`). Verifies the final state and bid count before closing it, then decrements `open_stores` to `0`.
+- May be called repeatedly to close stores in batches. Must finish before `close_rfq`.
+- Requires a host instruction that closes an encrypted store with its authority's signature and refunds rent to the User. The checked-in host only provides upgrade-authority preview cleanup; an authority-controlled close-store CPI is a required library extension for this operation.
+
+### Close RFQ (`close_rfq`)
 
 - Callable by anyone
-- State must be `Claimed`, `Canceled`, or `Invalid` and `bid_count` must be `0`.
-- Closes the RFQ, returning all rent to the User.
+- Requires `open_stores == 0`. `close_stores` has already verified the terminal state and zero bid count before closing the primary store.
+- Returns unused RFQ Funder lamports to the User and closes the RFQ, returning its remaining rent to the User.
 - There should be no tokens left owned by the RFQ and no bids left.
 
 # Other issues
