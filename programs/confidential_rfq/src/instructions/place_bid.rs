@@ -6,14 +6,20 @@
 //! transfer handles are granted to the RFQ store and compared to the promised
 //! collateral inside FHE before either price can become the winning offer.
 
-use crate::state::market::Market;
-use crate::state::rfq::{RFQ, RFQPrivateField};
-use crate::util::bid_cpi::{
-    invoke_bid_execution, invoke_returning_bid_execution, refund_token, transfer_token,
+use crate::{
+    ConfidentialRfqError, CurrentAccountVersion,
+    state::{
+        market::Market,
+        rfq::{RFQ, RFQPrivateField},
+    },
+    util::{
+        bid_cpi::{
+            invoke_bid_execution, invoke_returning_bid_execution, refund_token, transfer_token,
+        },
+        pda::{bid_receipt_seeds, rfq_state_signer_seeds},
+        rfq::validate_rfq_store,
+    },
 };
-use crate::util::pda::{bid_receipt_seeds, rfq_state_signer_seeds};
-use crate::util::rfq::validate_rfq_store;
-use crate::{ConfidentialRfqError, CurrentAccountVersion};
 use anchor_lang::prelude::*;
 use confidential_token as ct;
 use confidential_token::program::ConfidentialToken;
@@ -23,6 +29,8 @@ use zama_host::{CoprocessorInputAttestation, program::ZamaHost};
 
 /// Survives maker removal from the market, so an old bid can still be claimed
 /// only by the maker that submitted it.
+///
+/// TODO: Remove this, it's an AI hallucination.
 #[account]
 pub struct BidReceipt {
     pub rfq: Pubkey,
