@@ -20,12 +20,23 @@ use anchor_lang::prelude::*;
 use confidential_token::program::ConfidentialToken;
 use zama_fhe::{Bool, Encrypted, FheExecution, FheExecutionBuilder, Scalar, Store, StoreId, Uint};
 use zama_host::{CoprocessorInputAttestation, program::ZamaHost};
+use zama_solana_acl::{EncryptedStore, MAX_MMR_PEAKS};
+
+/// Three slots: MakerPrivateField::{Buy, Sell, Sequence}, plus maximum history.
+const MAKER_STORE_BYTES: usize = EncryptedStore::account_size(3, MAX_MMR_PEAKS);
+/// Twelve RFQPrivateField slots, including the CanClose predicate, plus maximum history.
+const RFQ_STORE_BYTES: usize = EncryptedStore::account_size(12, MAX_MMR_PEAKS);
+/// Maker and RFQ escrow token balance stores for each of the asset and basis mints.
+const TOKEN_BALANCE_STORE_COUNT: u64 = 4;
+/// Conservatively budget a full maker-sized store for growth of each token balance store.
+const TOKEN_BALANCE_STORE_RESERVE_BYTES: usize = MAKER_STORE_BYTES;
 
 #[derive(Accounts)]
 #[instruction(amounts: crate::util::EncryptedInput)]
 pub struct RequestQuote<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
+    #[account(constraint = market.version == Market::VERSION @ ConfidentialRfqError::InvalidRfqAccounts)]
     pub market: Box<Account<'info, Market>>,
     #[account(
         init,
@@ -36,14 +47,27 @@ pub struct RequestQuote<'info> {
     )]
     pub rfq: AccountLoader<'info, RFQ>,
     /// System-owned, data-empty reserve for subsequent bid storage.
-    #[account(mut, seeds = [b"rfq_funder", rfq.key().as_ref()], bump)]
+    #[account(
+        mut,
+        seeds = [b"rfq_funder", rfq.key().as_ref()],
+        bump,
+        constraint = rfq_funder.data_is_empty() @ ConfidentialRfqError::InvalidRfqAccounts,
+    )]
     pub rfq_funder: SystemAccount<'info>,
     /// CHECK: canonical host EncryptedStore created in this instruction.
-    #[account(mut)]
+    #[account(
+        mut,
+        address = StoreId::new(crate::ID, rfq.key(), amounts.input_handle).address()
+            @ ConfidentialRfqError::InvalidRfqAccounts,
+    )]
     pub rfq_store: UncheckedAccount<'info>,
     #[account(constraint = { asset.validate(user.key(), rfq.key())?; true })]
     pub asset: TokenSide<'info>,
-    #[account(constraint = { basis.validate(user.key(), rfq.key())?; true })]
+    #[account(
+        constraint = asset.confidential_mint.key() != basis.confidential_mint.key()
+            @ ConfidentialRfqError::InvalidRfqInput,
+        constraint = { basis.validate(user.key(), rfq.key())?; true },
+    )]
     pub basis: TokenSide<'info>,
 
     /// CHECK: host validates the canonical config.
@@ -122,17 +146,6 @@ pub fn request_quote<'info>(
         .map_err(|_| error!(ConfidentialRfqError::InvalidRfqInput))?
         .checked_add(MAXIMUM_TIMEOUT)
         .ok_or(ConfidentialRfqError::InvalidRfqInput)?;
-    require!(
-        ctx.accounts.market.version == Market::VERSION,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    // Check mints are not the same.
-    require_keys_neq!(
-        ctx.accounts.asset.confidential_mint.key(),
-        ctx.accounts.basis.confidential_mint.key(),
-        ConfidentialRfqError::InvalidRfqInput
-    );
-
     // Validate inputs.
     let user = ctx.accounts.user.key;
     for input in [&amounts, &user_buyer, &timeout] {
@@ -140,13 +153,6 @@ pub fn request_quote<'info>(
     }
 
     let scope = amounts.input_handle;
-    let store_id = StoreId::new(crate::ID, ctx.accounts.rfq.key(), scope);
-    require_keys_eq!(
-        ctx.accounts.rfq_store.key(),
-        store_id.address(),
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-
     *ctx.accounts.rfq.load_init()? = RFQ {
         version: RFQ::VERSION,
         market: ctx.accounts.market.key(),
@@ -161,19 +167,17 @@ pub fn request_quote<'info>(
 
     // Reserve each maker store's maximum MMR footprint, plus shared bookkeeping and
     // token-store growth. The user may top up this PDA directly for further bids.
-    require!(
-        ctx.accounts.rfq_funder.data_is_empty(),
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
     let rent = Rent::get()?;
-    let maker_store_bytes = 8 + 32 * 3 + 4 + 64 * 3 + 8 + 4 + 32 * 64 + 1;
-    let shared_store_bytes = maker_store_bytes + 64 * 9;
+    // Shared allowance: the RFQ's private fields and growth of the four token balance stores.
     let shared_reserve = rent
-        .minimum_balance(shared_store_bytes)
-        .checked_add(4 * rent.minimum_balance(maker_store_bytes))
+        .minimum_balance(RFQ_STORE_BYTES)
+        .checked_add(
+            TOKEN_BALANCE_STORE_COUNT * rent.minimum_balance(TOKEN_BALANCE_STORE_RESERVE_BYTES),
+        )
         .ok_or(ConfidentialRfqError::InvalidRfqInput)?;
+    // Each requested bid-capacity unit additionally reserves one maker's private bid store.
     let reserve = rent
-        .minimum_balance(maker_store_bytes)
+        .minimum_balance(MAKER_STORE_BYTES)
         .checked_mul(u64::from(bid_capacity))
         .and_then(|amount| amount.checked_add(shared_reserve))
         .ok_or(ConfidentialRfqError::InvalidRfqInput)?;
@@ -256,6 +260,7 @@ fn initialize_fields<'info>(
 
 /// Verify and persist the user's terms, retaining their produced handles for validity checks.
 #[inline(never)]
+#[allow(clippy::boxed_local)]
 fn initialize_terms<'id>(
     fhe: &mut FheExecutionBuilder<'id>,
     store: &Store<'_>,

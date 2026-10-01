@@ -69,6 +69,8 @@ pub fn revoke_delegation_for_user_decryption<'info>(
     ))
 }
 
+// Keep FHE account resolution and invocation out of the settlement handlers' SBF stack frames.
+#[inline(never)]
 pub fn invoke_returning<'info, T: FheTyped>(
     execution: ReturningFheExecution<T>,
     accounts: ExecutionCpiAccounts<'info>,
@@ -100,6 +102,8 @@ pub fn invoke_returning<'info, T: FheTyped>(
     execution.invoke(accounts, &resolved, signer_seeds)
 }
 
+// Keep the token CPI's account assembly out of the settlement handlers' SBF stack frames.
+#[inline(never)]
 pub fn transfer_from_grant<'info>(
     program: Pubkey,
     accounts: ct::cpi::accounts::ConfidentialTransferFromValue<'info>,

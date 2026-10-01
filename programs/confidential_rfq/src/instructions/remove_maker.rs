@@ -11,6 +11,7 @@ use anchor_lang::prelude::*;
 use zama_host::program::ZamaHost;
 
 #[derive(Accounts)]
+#[instruction(maker_id: u32)]
 pub struct RemoveMaker<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
@@ -24,29 +25,21 @@ pub struct RemoveMaker<'info> {
     #[account(seeds = market_maker_group_seeds(&market).as_slice(), bump = market.maker_group_bump)]
     pub maker_group: UncheckedAccount<'info>,
     pub host_config: Box<Account<'info, zama_host::HostConfig>>,
-    /// CHECK: canonical host delegation PDA, checked by host CPI.
-    #[account(mut)]
+    /// CHECK: canonical host delegation PDA, also checked by host CPI.
+    #[account(
+        mut,
+        address = zama_host::user_decryption_delegation_address(
+            maker_group.key(),
+            market.active_maker(maker_id).ok_or(crate::ConfidentialRfqError::MakerNotFound)?,
+            Pubkey::new_from_array(zama_host::WILDCARD_AUTHORITY_BYTES),
+        ).0 @ crate::ConfidentialRfqError::InvalidRfqAccounts,
+    )]
     pub delegation_record: UncheckedAccount<'info>,
     pub zama_program: Program<'info, ZamaHost>,
     pub system_program: Program<'info, System>,
 }
 
 pub fn remove_maker(ctx: Context<RemoveMaker>, maker_id: u32) -> Result<()> {
-    let maker = ctx
-        .accounts
-        .market
-        .active_maker(maker_id)
-        .ok_or(error!(crate::ConfidentialRfqError::MakerNotFound))?;
-    require_keys_eq!(
-        ctx.accounts.delegation_record.key(),
-        zama_host::user_decryption_delegation_address(
-            ctx.accounts.maker_group.key(),
-            maker,
-            Pubkey::new_from_array(zama_host::WILDCARD_AUTHORITY_BYTES),
-        )
-        .0,
-        crate::ConfidentialRfqError::InvalidRfqAccounts
-    );
     ctx.accounts.market.remove_maker(maker_id)?;
 
     let seeds = &market_maker_group_signer_seeds(&ctx.accounts.market);

@@ -33,13 +33,25 @@ use zama_host::{CoprocessorInputAttestation, EncryptedStore, program::ZamaHost};
 pub struct PlaceBid<'info> {
     /// Active market maker and authority for deposits from their token accounts.
     pub maker: Signer<'info>,
+    #[account(
+        constraint = market.version == Market::VERSION @ ConfidentialRfqError::InvalidRfqAccounts,
+        constraint = maker_id != 0 @ ConfidentialRfqError::InvalidMakerId,
+        constraint = market.active_maker(maker_id) == Some(maker.key())
+            @ ConfidentialRfqError::UnauthorizedMaker,
+    )]
     pub market: Box<Account<'info, Market>>,
-    #[account(mut)]
+    #[account(mut, has_one = market @ ConfidentialRfqError::MarketMismatch)]
     pub rfq: AccountLoader<'info, RFQ>,
     #[account(mut, seeds = [b"rfq_funder", rfq.key().as_ref()], bump = rfq.load()?.funder_bump,
         constraint = rfq_funder.data_is_empty() @ ConfidentialRfqError::InvalidRfqAccounts)]
     pub rfq_funder: SystemAccount<'info>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = {
+            validate_rfq_store(rfq.key(), &*rfq.load()?, rfq_store.key(), &rfq_store)?;
+            true
+        },
+    )]
     pub rfq_store: Box<Account<'info, EncryptedStore>>,
     /// CHECK: canonical RFQ/maker authority; signs every write to the maker store.
     #[account(seeds = [b"rfq_maker_store", rfq.key().as_ref(), &maker_id.to_le_bytes()], bump)]
@@ -47,9 +59,17 @@ pub struct PlaceBid<'info> {
     /// CHECK: canonical host store, created on first use and validated in the handler.
     #[account(mut)]
     pub maker_store: UncheckedAccount<'info>,
-    #[account(constraint = { asset.validate(maker.key(), rfq.key())?; true })]
+    #[account(
+        constraint = asset.confidential_mint.key() == rfq.load()?.asset_mint
+            @ ConfidentialRfqError::MintMismatch,
+        constraint = { asset.validate(maker.key(), rfq.key())?; true },
+    )]
     pub asset: TokenSide<'info>,
-    #[account(constraint = { basis.validate(maker.key(), rfq.key())?; true })]
+    #[account(
+        constraint = basis.confidential_mint.key() == rfq.load()?.basis_mint
+            @ ConfidentialRfqError::MintMismatch,
+        constraint = { basis.validate(maker.key(), rfq.key())?; true },
+    )]
     pub basis: TokenSide<'info>,
     /// CHECK: validated by the confidential-token event CPI.
     pub confidential_token_event_authority: UncheckedAccount<'info>,
@@ -74,6 +94,7 @@ pub struct PlaceBid<'info> {
 
 /// `prices` packs `(maker_buy << 64) | maker_sell`. Both prices are total basis
 /// token amounts. Buy collateral is the buy quote; sell collateral is RFQ size.
+#[allow(clippy::boxed_local)]
 pub fn place_bid<'info>(
     ctx: Context<'info, PlaceBid<'info>>,
     maker_id: u32,
@@ -81,40 +102,8 @@ pub fn place_bid<'info>(
     asset_transfer_attestation: Box<CoprocessorInputAttestation>,
     basis_transfer_attestation: Box<CoprocessorInputAttestation>,
 ) -> Result<()> {
-    // Bind the public identities before creating stores or spending any funds.
-    require!(maker_id != 0, ConfidentialRfqError::InvalidMakerId);
     let rfq = *ctx.accounts.rfq.load()?;
     let rfq_key = ctx.accounts.rfq.key();
-    require_eq!(
-        ctx.accounts.market.version,
-        Market::VERSION,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    require_keys_eq!(
-        rfq.market,
-        ctx.accounts.market.key(),
-        ConfidentialRfqError::MarketMismatch
-    );
-    require!(
-        ctx.accounts.market.active_maker(maker_id) == Some(ctx.accounts.maker.key()),
-        ConfidentialRfqError::UnauthorizedMaker
-    );
-    require_keys_eq!(
-        rfq.asset_mint,
-        ctx.accounts.asset.confidential_mint.key(),
-        ConfidentialRfqError::MintMismatch
-    );
-    require_keys_eq!(
-        rfq.basis_mint,
-        ctx.accounts.basis.confidential_mint.key(),
-        ConfidentialRfqError::MintMismatch
-    );
-    validate_rfq_store(
-        rfq_key,
-        &rfq,
-        ctx.accounts.rfq_store.key(),
-        &ctx.accounts.rfq_store,
-    )?;
     prices.validate(ctx.accounts.maker.key(), crate::ID)?;
     asset_transfer_attestation.validate(ctx.accounts.maker.key(), ct::ID)?;
     basis_transfer_attestation.validate(ctx.accounts.maker.key(), ct::ID)?;
@@ -226,6 +215,7 @@ enum BidPrices {
 /// Transfer the maker's attested deposit, accept only the exact required delta,
 /// and refund decreases or the entire deposit when the attempted change fails.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn adjust_collateral<'info>(
     ctx: &Context<'info, PlaceBid<'info>>,
     rfq_store: &RFQStore<'_>,
@@ -291,6 +281,7 @@ struct CollateralInputs {
 /// Failed, expired, and malformed changes refund the entire actual transfer.
 /// The basis phase commits one active-count transition across both side updates.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn build_collateral_adjustment(
     rfq: &RFQStore<'_>,
     maker_state: &EncryptedStore,
@@ -355,8 +346,7 @@ fn build_collateral_adjustment(
                 BidPrices::Attested(attestation) => {
                     let input = fhe.verified_input::<Uint<128>>(*attestation)?;
                     // The checked journal reader takes this first produced result.
-                    let prices = fhe.or(input, Scalar::<Uint<128>>::u128(0))?;
-                    prices
+                    fhe.or(input, Scalar::<Uint<128>>::u128(0))?
                 }
                 BidPrices::Granted(continuation) => {
                     rfq.granted::<Uint<128>>(continuation.prices)?.into()

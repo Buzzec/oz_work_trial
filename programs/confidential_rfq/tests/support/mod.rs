@@ -351,6 +351,115 @@ impl RfqFixture {
             .clone();
         bytemuck::pod_read_unaligned(&data[RFQ::DISCRIMINATOR.len()..])
     }
+    /// Build lifecycle instructions with fixed beneficiaries; normal user claims are relayed.
+    pub fn expire(&self) -> Instruction {
+        kit::anchor_ix(
+            confidential_rfq::ID,
+            accounts::ExpireRfq {
+                caller: self.user,
+                market: self.market,
+                rfq: self.rfq,
+                rfq_store: self.rfq_store,
+                host_config: self.host_config,
+                zama_event_authority: kit::event_authority(zama_host::ID),
+                transient_store: zama_host::transient_store_address(self.user).0,
+                instructions: solana_sdk::sysvar::instructions::ID,
+                zama_program: zama_host::ID,
+                system_program: System::id(),
+            },
+            instruction::ExpireRfq { maker_id: None },
+        )
+    }
+
+    pub fn maker_store(&self, maker_id: u32) -> (Pubkey, Pubkey) {
+        let authority = confidential_rfq::util::pda::maker_store_address(self.rfq, maker_id).0;
+        let store =
+            zama_host::encrypted_store_address(confidential_rfq::ID, authority, self.state().nonce)
+                .0;
+        (authority, store)
+    }
+
+    pub fn scan(&self, maker_id: u32) -> Instruction {
+        let (maker_store_authority, maker_store) = self.maker_store(maker_id);
+        kit::anchor_ix(
+            confidential_rfq::ID,
+            accounts::CalculateWinner {
+                caller: self.user,
+                rfq: self.rfq,
+                rfq_store: self.rfq_store,
+                maker_store_authority,
+                maker_store,
+                host_config: self.host_config,
+                zama_event_authority: kit::event_authority(zama_host::ID),
+                transient_store: zama_host::transient_store_address(self.user).0,
+                instructions: solana_sdk::sysvar::instructions::ID,
+                zama_program: zama_host::ID,
+                system_program: System::id(),
+            },
+            instruction::CalculateWinner { maker_id },
+        )
+    }
+
+    pub fn user_claim(&self, cancel: bool) -> Instruction {
+        let accounts = accounts::ClaimRfqUser {
+            // A different signer submits the normal claim; the beneficiary remains the user.
+            caller: if cancel { self.user } else { self.makers[2] },
+            user: self.user,
+            rfq: self.rfq,
+            rfq_store: self.rfq_store,
+            asset: self.asset.side(self.user, self.rfq),
+            basis: self.basis.side(self.user, self.rfq),
+            host_config: self.host_config,
+            zama_event_authority: kit::event_authority(zama_host::ID),
+            transient_store: zama_host::transient_store_address(self.user).0,
+            instructions: solana_sdk::sysvar::instructions::ID,
+            zama_program: zama_host::ID,
+            confidential_token_event_authority: kit::event_authority(confidential_token::ID),
+            confidential_token_program: confidential_token::ID,
+            system_program: System::id(),
+        };
+        if cancel {
+            kit::anchor_ix(confidential_rfq::ID, accounts, instruction::CancelQuote {})
+        } else {
+            kit::anchor_ix(confidential_rfq::ID, accounts, instruction::ClaimRfqUser {})
+        }
+    }
+
+    pub fn maker_claim(&self, maker_id: u32) -> Instruction {
+        let maker = self.makers[maker_id as usize - 1];
+        let (maker_store_authority, maker_store) = self.maker_store(maker_id);
+        kit::anchor_ix(
+            confidential_rfq::ID,
+            accounts::ClaimRfqMaker {
+                caller: self.user,
+                maker,
+                market: self.market,
+                rfq: self.rfq,
+                rfq_store: self.rfq_store,
+                maker_store_authority,
+                maker_store,
+                asset: self.asset.side(maker, self.rfq),
+                basis: self.basis.side(maker, self.rfq),
+                host_config: self.host_config,
+                zama_event_authority: kit::event_authority(zama_host::ID),
+                transient_store: zama_host::transient_store_address(self.user).0,
+                instructions: solana_sdk::sysvar::instructions::ID,
+                zama_program: zama_host::ID,
+                confidential_token_event_authority: kit::event_authority(confidential_token::ID),
+                confidential_token_program: confidential_token::ID,
+                system_program: System::id(),
+            },
+            instruction::ClaimRfqMaker { maker_id },
+        )
+    }
+
+    pub fn maker_value(
+        &self,
+        maker_id: u32,
+        field: confidential_rfq::state::rfq::MakerPrivateField,
+    ) -> u64 {
+        self.store_value(self.maker_store(maker_id).1, field.key())
+    }
     pub fn set_clock(&mut self, now: u64) {
         self.context.mollusk.sysvars.clock.unix_timestamp = now as i64;
     }

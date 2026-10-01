@@ -14,12 +14,27 @@ use crate::{
 };
 
 #[derive(Accounts)]
+#[instruction(maker_id: Option<u32>)]
 pub struct ExpireRfq<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
+    #[account(constraint = market.version == Market::VERSION @ ConfidentialRfqError::InvalidRfqAccounts)]
     pub market: Box<Account<'info, Market>>,
+    // Both the user and an active maker with deadline access may request expiry.
+    #[account(
+        has_one = market @ ConfidentialRfqError::MarketMismatch,
+        constraint = caller.key() == rfq.load()?.user
+            || maker_id.and_then(|id| market.active_maker(id)) == Some(caller.key())
+            @ ConfidentialRfqError::UnauthorizedMaker,
+    )]
     pub rfq: AccountLoader<'info, RFQ>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = {
+            validate_rfq_store(rfq.key(), &*rfq.load()?, rfq_store.key(), &rfq_store)?;
+            true
+        },
+    )]
     pub rfq_store: Box<Account<'info, EncryptedStore>>,
     /// CHECK: validated by the host CPI.
     pub host_config: UncheckedAccount<'info>,
@@ -36,34 +51,9 @@ pub struct ExpireRfq<'info> {
 
 pub fn expire_rfq<'info>(
     ctx: Context<'info, ExpireRfq<'info>>,
-    maker_id: Option<u32>,
+    _maker_id: Option<u32>,
 ) -> Result<()> {
-    let rfq_key = ctx.accounts.rfq.key();
     let rfq = *ctx.accounts.rfq.load()?;
-    require_eq!(
-        ctx.accounts.market.version,
-        Market::VERSION,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    require_keys_eq!(
-        ctx.accounts.market.key(),
-        rfq.market,
-        ConfidentialRfqError::MarketMismatch
-    );
-    // Both the user and a maker with deadline access may request the FHE transition.
-    if ctx.accounts.caller.key() != rfq.user {
-        let id = maker_id.ok_or(error!(ConfidentialRfqError::UnauthorizedMaker))?;
-        require!(
-            ctx.accounts.market.active_maker(id) == Some(ctx.accounts.caller.key()),
-            ConfidentialRfqError::UnauthorizedMaker
-        );
-    }
-    validate_rfq_store(
-        rfq_key,
-        &rfq,
-        ctx.accounts.rfq_store.key(),
-        &ctx.accounts.rfq_store,
-    )?;
     let now = u64::try_from(Clock::get()?.unix_timestamp)
         .map_err(|_| error!(ConfidentialRfqError::InvalidRfqInput))?;
     let execution = expiry_execution(&ctx.accounts.rfq_store, now)?;

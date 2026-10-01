@@ -14,25 +14,37 @@ use crate::{
         CurrentAccountVersion,
         rfq::{RFQ, RFQPrivateField},
     },
-    util::{
-        close_rfq_cpi,
-        pda::{rfq_funder_address, rfq_funder_signer_seeds},
-        rfq::validate_rfq_store,
-    },
+    util::{close_rfq_cpi, pda::rfq_funder_signer_seeds, rfq::validate_rfq_store},
 };
 
 #[derive(Accounts)]
 pub struct CloseRfq<'info> {
     /// Anyone may close the RFQ; all available rent goes to its recorded user.
-    #[account(mut, close = user)]
+    #[account(
+        mut,
+        close = user,
+        has_one = user @ ConfidentialRfqError::InvalidUser,
+        constraint = rfq.load()?.version == RFQ::VERSION @ ConfidentialRfqError::InvalidRfqVersion,
+    )]
     pub rfq: AccountLoader<'info, RFQ>,
     /// CHECK: compared with `rfq.user`; receives the RFQ and funder rent.
     #[account(mut)]
     pub user: UncheckedAccount<'info>,
     /// System-owned, data-empty rent reserve, checked against the RFQ-bound PDA.
-    #[account(mut)]
+    #[account(
+        mut,
+        seeds = [b"rfq_funder", rfq.key().as_ref()],
+        bump,
+        constraint = rfq_funder.data_is_empty() @ ConfidentialRfqError::InvalidRfqAccounts,
+        constraint = rfq.load()?.funder_bump == crate::util::pda::rfq_funder_address(rfq.key()).1
+            @ ConfidentialRfqError::InvalidRfqAccounts,
+    )]
     pub rfq_funder: SystemAccount<'info>,
     /// Retained primary store containing the current public closure predicate.
+    #[account(constraint = {
+        validate_rfq_store(rfq.key(), &*rfq.load()?, rfq_store.key(), &rfq_store)?;
+        true
+    })]
     pub rfq_store: Box<Account<'info, EncryptedStore>>,
     pub host_config: Box<Account<'info, HostConfig>>,
     pub kms_context: Box<Account<'info, KmsContext>>,
@@ -50,35 +62,11 @@ pub fn close_rfq<'info>(
     proof: MmrInclusionProof,
 ) -> Result<()> {
     let rfq_key = ctx.accounts.rfq.key();
-    let rfq = *ctx.accounts.rfq.load()?;
-
-    // Bind every account to this RFQ before verifying the certificate or moving rent.
-    require!(
-        rfq.version == RFQ::VERSION,
-        ConfidentialRfqError::InvalidRfqVersion
-    );
-    require_keys_eq!(
-        ctx.accounts.user.key(),
-        rfq.user,
-        ConfidentialRfqError::InvalidUser
-    );
     require!(
         ctx.remaining_accounts.is_empty(),
         ConfidentialRfqError::InvalidRfqAccounts
     );
-    validate_rfq_store(
-        rfq_key,
-        &rfq,
-        ctx.accounts.rfq_store.key(),
-        &ctx.accounts.rfq_store,
-    )?;
-    let (funder, funder_bump) = rfq_funder_address(rfq_key);
-    require!(
-        ctx.accounts.rfq_funder.key() == funder
-            && funder_bump == rfq.funder_bump
-            && ctx.accounts.rfq_funder.data_is_empty(),
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
+    let funder_bump = ctx.bumps.rfq_funder;
 
     // Certify the current slot handle, never a historical true value. open_stores
     // continues to describe retained storage and does not gate account closure.

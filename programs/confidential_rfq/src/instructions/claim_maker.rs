@@ -16,7 +16,7 @@ use crate::{
     },
     util::{
         cpi,
-        pda::{maker_store_address, maker_store_signer_seeds, rfq_state_signer_seeds},
+        pda::{maker_store_signer_seeds, rfq_state_signer_seeds},
         rfq::{validate_maker_store, validate_rfq_store},
         token_side::{
             __client_accounts_token_side, __cpi_client_accounts_token_side, TokenSide,
@@ -26,20 +26,51 @@ use crate::{
 };
 
 #[derive(Accounts)]
+#[instruction(maker_id: u32)]
 pub struct ClaimRfqMaker<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
     /// CHECK: matched to the market's permanent maker identity, including disabled makers.
     pub maker: UncheckedAccount<'info>,
+    #[account(
+        constraint = market.version == Market::VERSION @ ConfidentialRfqError::InvalidRfqAccounts,
+        constraint = maker_id != 0 @ ConfidentialRfqError::InvalidMakerId,
+        constraint = market.maker(maker_id) == Some(maker.key())
+            @ ConfidentialRfqError::UnauthorizedMaker,
+    )]
     pub market: Box<Account<'info, Market>>,
+    #[account(has_one = market @ ConfidentialRfqError::MarketMismatch)]
     pub rfq: AccountLoader<'info, RFQ>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = {
+            validate_rfq_store(rfq.key(), &*rfq.load()?, rfq_store.key(), &rfq_store)?;
+            true
+        },
+    )]
     pub rfq_store: Box<Account<'info, EncryptedStore>>,
     /// CHECK: validated against the RFQ-specific maker authority PDA.
+    #[account(seeds = [b"rfq_maker_store", rfq.key().as_ref(), &maker_id.to_le_bytes()], bump)]
     pub maker_store_authority: UncheckedAccount<'info>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = {
+            validate_maker_store(rfq.key(), &*rfq.load()?, maker_id, maker_store.key(), &maker_store)?;
+            true
+        },
+    )]
     pub maker_store: Box<Account<'info, EncryptedStore>>,
+    #[account(
+        constraint = asset.confidential_mint.key() == rfq.load()?.asset_mint
+            @ ConfidentialRfqError::MintMismatch,
+        constraint = { asset.validate(maker.key(), rfq.key())?; true },
+    )]
     pub asset: TokenSide<'info>,
+    #[account(
+        constraint = basis.confidential_mint.key() == rfq.load()?.basis_mint
+            @ ConfidentialRfqError::MintMismatch,
+        constraint = { basis.validate(maker.key(), rfq.key())?; true },
+    )]
     pub basis: TokenSide<'info>,
     /// CHECK: validated by the host CPI.
     pub host_config: UncheckedAccount<'info>,
@@ -63,51 +94,7 @@ pub fn claim_rfq_maker<'info>(
 ) -> Result<()> {
     let rfq_key = ctx.accounts.rfq.key();
     let rfq = *ctx.accounts.rfq.load()?;
-    require_eq!(
-        ctx.accounts.market.version,
-        Market::VERSION,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    require!(maker_id != 0, ConfidentialRfqError::InvalidMakerId);
-    require_keys_eq!(
-        ctx.accounts.market.key(),
-        rfq.market,
-        ConfidentialRfqError::MarketMismatch
-    );
-    require!(
-        ctx.accounts.market.maker(maker_id) == Some(ctx.accounts.maker.key()),
-        ConfidentialRfqError::UnauthorizedMaker
-    );
-    validate_rfq_store(
-        rfq_key,
-        &rfq,
-        ctx.accounts.rfq_store.key(),
-        &ctx.accounts.rfq_store,
-    )?;
-    validate_maker_store(
-        rfq_key,
-        &rfq,
-        maker_id,
-        ctx.accounts.maker_store.key(),
-        &ctx.accounts.maker_store,
-    )?;
-    let (maker_authority, maker_bump) = maker_store_address(rfq_key, maker_id);
-    require_keys_eq!(
-        ctx.accounts.maker_store_authority.key(),
-        maker_authority,
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    for (side, mint) in [
-        (&ctx.accounts.asset, rfq.asset_mint),
-        (&ctx.accounts.basis, rfq.basis_mint),
-    ] {
-        require_keys_eq!(
-            side.confidential_mint.key(),
-            mint,
-            ConfidentialRfqError::MintMismatch
-        );
-        side.validate(ctx.accounts.maker.key(), rfq_key)?;
-    }
+    let maker_bump = ctx.bumps.maker_store_authority;
     let rfq_seeds = rfq_state_signer_seeds(&rfq, &rfq.nonce);
     let id_bytes = maker_id.to_le_bytes();
     let maker_seeds = maker_store_signer_seeds(&rfq_key, &id_bytes, &maker_bump);

@@ -23,13 +23,37 @@ use crate::{
 pub struct FundQuote<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
+    #[account(has_one = user @ ConfidentialRfqError::InvalidUser)]
     pub rfq: AccountLoader<'info, RFQ>,
-    /// CHECK: host ownership, canonical address, and RFQ identity are checked in the handler.
-    #[account(mut)]
+    /// CHECK: the constraint validates ownership and RFQ identity; reread after CPI mutations.
+    #[account(
+        mut,
+        constraint = {
+            let state = read_encrypted_store(&rfq_store)?;
+            validate_rfq_store(rfq.key(), &*rfq.load()?, rfq_store.key(), &state)?;
+            true
+        },
+    )]
     pub rfq_store: UncheckedAccount<'info>,
-    #[account(constraint = { asset.validate(user.key(), rfq.key())?; true })]
+    #[account(
+        constraint = asset.confidential_mint.key() == rfq.load()?.asset_mint
+            @ ConfidentialRfqError::InvalidRfqAccounts,
+        constraint = {
+            asset.validate(user.key(), rfq.key())?;
+            asset.validate_prepared_escrow(rfq.key())?;
+            true
+        },
+    )]
     pub asset: TokenSide<'info>,
-    #[account(constraint = { basis.validate(user.key(), rfq.key())?; true })]
+    #[account(
+        constraint = basis.confidential_mint.key() == rfq.load()?.basis_mint
+            @ ConfidentialRfqError::InvalidRfqAccounts,
+        constraint = {
+            basis.validate(user.key(), rfq.key())?;
+            basis.validate_prepared_escrow(rfq.key())?;
+            true
+        },
+    )]
     pub basis: TokenSide<'info>,
     /// CHECK: host validates the canonical config.
     pub host_config: UncheckedAccount<'info>,
@@ -54,31 +78,7 @@ pub fn fund_quote<'info>(
     asset_escrow: Box<CoprocessorInputAttestation>,
     basis_escrow: Box<CoprocessorInputAttestation>,
 ) -> Result<()> {
-    // Bind public identities before any token movement; private state is handled by the circuit.
     let rfq = *ctx.accounts.rfq.load()?;
-    let state = read_encrypted_store(&ctx.accounts.rfq_store)?;
-    validate_rfq_store(
-        ctx.accounts.rfq.key(),
-        &rfq,
-        ctx.accounts.rfq_store.key(),
-        &state,
-    )?;
-    require_keys_eq!(
-        rfq.user,
-        ctx.accounts.user.key(),
-        ConfidentialRfqError::InvalidUser
-    );
-    require!(
-        rfq.asset_mint == ctx.accounts.asset.confidential_mint.key()
-            && rfq.basis_mint == ctx.accounts.basis.confidential_mint.key(),
-        ConfidentialRfqError::InvalidRfqAccounts
-    );
-    ctx.accounts
-        .asset
-        .validate_prepared_escrow(ctx.accounts.rfq.key())?;
-    ctx.accounts
-        .basis
-        .validate_prepared_escrow(ctx.accounts.rfq.key())?;
     for input in [&asset_escrow, &basis_escrow] {
         input.validate(ctx.accounts.user.key(), ct::ID)?;
     }
